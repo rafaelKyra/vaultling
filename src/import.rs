@@ -18,6 +18,8 @@ pub struct Incoming {
     pub totp: Option<String>,
     pub notes: Option<String>,
     pub tags: Option<String>,
+    /// Category, when the file says (Vaultling's own export does).
+    pub kind: Option<crate::kind::Kind>,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -27,6 +29,8 @@ pub enum Source {
     Bitwarden,
     LastPass,
     KeePass,
+    /// Vaultling's own export.
+    Vaultling,
     /// Headers we recognised field-by-field without matching a known product.
     Generic,
 }
@@ -39,6 +43,7 @@ impl Source {
             Source::Bitwarden => "Bitwarden",
             Source::LastPass => "LastPass",
             Source::KeePass => "KeePass",
+            Source::Vaultling => "Vaultling",
             Source::Generic => "generic CSV",
         }
     }
@@ -136,7 +141,9 @@ fn find(headers: &[String], names: &[&str]) -> Option<usize> {
 /// Detect the product from its header row.
 pub fn detect(headers: &[String]) -> Source {
     let has = |n: &str| headers.iter().any(|h| h.eq_ignore_ascii_case(n));
-    if has("login_uri") && has("login_password") {
+    if has("kind") && has("name") && has("password") && has("tags") {
+        Source::Vaultling
+    } else if has("login_uri") && has("login_password") {
         Source::Bitwarden
     } else if has("url") && has("username") && has("password") && has("grouping") {
         Source::LastPass
@@ -153,6 +160,88 @@ pub fn detect(headers: &[String]) -> Source {
 
 /// Parse a CSV export into rows ready for the vault.
 pub fn parse(text: &str) -> Result<(Source, Vec<Incoming>), ImportError> {
+    parse_counting(text).map(|(source, rows, _)| (source, rows))
+}
+
+/// Read a KeePass (KDBX 4) database from `reader`.
+///
+/// Returns the entries that have a title and a password, and how many entries
+/// were left out for lacking either. The enclosing group's name becomes the
+/// tag, so KeePass folders survive as something searchable. Errors are
+/// deliberately vague about the cause: a wrong password and a damaged file look
+/// the same from outside, and saying which would help an attacker.
+pub fn parse_kdbx<R: std::io::Read>(
+    reader: &mut R,
+    password: &str,
+) -> Result<(Vec<Incoming>, usize), String> {
+    let key = keepass::DatabaseKey::new().with_password(password);
+    let db = keepass::Database::open(reader, key)
+        .map_err(|_| "wrong password, or not a KDBX 4 file".to_string())?;
+    let mut rows = Vec::new();
+    let mut skipped = 0usize;
+    collect_group(db.root(), None, &mut rows, &mut skipped);
+    Ok((rows, skipped))
+}
+
+fn collect_group(
+    group: keepass::db::GroupRef<'_>,
+    path: Option<&str>,
+    rows: &mut Vec<Incoming>,
+    skipped: &mut usize,
+) {
+    for e in group.entries() {
+        match (e.get_title(), e.get_password()) {
+            (Some(title), Some(pw)) if !title.is_empty() && !pw.is_empty() => {
+                let nonempty = |v: Option<&str>| v.filter(|s| !s.is_empty()).map(str::to_string);
+                rows.push(Incoming {
+                    name: title.to_string(),
+                    username: e.get_username().unwrap_or("").to_string(),
+                    password: pw.to_string(),
+                    uri: nonempty(e.get("URL")),
+                    // KeePass keeps TOTP under "otp", as an otpauth URI.
+                    totp: e.get("otp").and_then(crate::totp::normalize_secret),
+                    notes: nonempty(e.get("Notes")),
+                    tags: path.map(str::to_string),
+                    kind: None,
+                });
+            }
+            _ => *skipped += 1,
+        }
+    }
+    // Only sub-folders become tags; the database root is unnamed for our
+    // purposes.
+    for g in group.groups() {
+        let name = g.name.clone();
+        collect_group(g, Some(name.as_str()), rows, skipped);
+    }
+}
+
+/// Drop rows that already exist, or that repeat earlier rows of the same file.
+///
+/// Two entries are the same when name (ignoring case), username and password
+/// all match. `existing` is `(name, username, password)` of what the vault
+/// already holds. Returns the rows to insert and how many were dropped.
+pub fn without_duplicates<'a>(
+    existing: impl IntoIterator<Item = (&'a str, &'a str, &'a str)>,
+    rows: Vec<Incoming>,
+) -> (Vec<Incoming>, usize) {
+    let mut seen: std::collections::HashSet<(String, String, String)> = existing
+        .into_iter()
+        .map(|(n, u, p)| (n.to_lowercase(), u.to_string(), p.to_string()))
+        .collect();
+    let before = rows.len();
+    let kept: Vec<Incoming> = rows
+        .into_iter()
+        .filter(|r| seen.insert((r.name.to_lowercase(), r.username.clone(), r.password.clone())))
+        .collect();
+    let dropped = before - kept.len();
+    (kept, dropped)
+}
+
+/// Like [`parse`], and also says how many rows were left out because they
+/// carried no password, so the caller can tell the user instead of letting
+/// entries disappear without a word.
+pub fn parse_counting(text: &str) -> Result<(Source, Vec<Incoming>, usize), ImportError> {
     let recs = records(text);
     if recs.is_empty() {
         return Err(ImportError::Empty);
@@ -173,6 +262,8 @@ pub fn parse(text: &str) -> Result<(Source, Vec<Incoming>), ImportError> {
     let i_totp = find(&headers, &["totp", "login_totp", "otpauth", "otp"]);
     let i_notes = find(&headers, &["notes", "note", "comment", "extra"]);
     let i_tags = find(&headers, &["grouping", "group", "folder", "category", "tags"]);
+    // Only Vaultling's own export has this column.
+    let i_kind = find(&headers, &["kind"]);
 
     let get = |row: &[String], idx: Option<usize>| -> Option<String> {
         idx.and_then(|i| row.get(i))
@@ -181,6 +272,7 @@ pub fn parse(text: &str) -> Result<(Source, Vec<Incoming>), ImportError> {
     };
 
     let mut out = Vec::new();
+    let mut skipped = 0usize;
     for (n, rec) in recs.iter().enumerate().skip(1) {
         let row = split_csv_line(rec);
         // Trailing empty columns are common and harmless; a row that is short
@@ -191,7 +283,10 @@ pub fn parse(text: &str) -> Result<(Source, Vec<Incoming>), ImportError> {
         let password = row[i_pass].trim().to_string();
         // Rows with no password are bookmarks, not credentials. Chrome and
         // Firefox both emit them.
-        if password.is_empty() {
+        // Vaultling's own export keeps entries that have no password (secure
+        // notes, recovery codes) because it also says what they are.
+        if password.is_empty() && !(i_kind.is_some() && get(&row, i_name).is_some()) {
+            skipped += 1;
             continue;
         }
         let name = get(&row, i_name)
@@ -206,10 +301,11 @@ pub fn parse(text: &str) -> Result<(Source, Vec<Incoming>), ImportError> {
             totp: get(&row, i_totp).and_then(|t| crate::totp::normalize_secret(&t)),
             notes: get(&row, i_notes),
             tags: get(&row, i_tags),
+            kind: get(&row, i_kind).and_then(|k| crate::kind::Kind::from_label(&k)),
         });
     }
 
-    Ok((source, out))
+    Ok((source, out, skipped))
 }
 
 #[cfg(test)]
@@ -283,6 +379,77 @@ mod tests {
         let (_, rows) = parse(csv).unwrap();
         assert_eq!(rows.len(), 1, "a quoted newline must not split the record");
         assert_eq!(rows[0].notes.as_deref(), Some("line one\nline two"));
+    }
+
+    #[test]
+    fn duplicates_of_the_vault_and_of_the_file_are_dropped() {
+        let row = |n: &str, u: &str, p: &str| Incoming {
+            name: n.into(),
+            username: u.into(),
+            password: p.into(),
+            uri: None,
+            totp: None,
+            notes: None,
+            tags: None,
+            kind: None,
+        };
+        let rows = vec![
+            row("Mail", "me", "pw1"),
+            row("mail", "me", "pw1"),   // same entry, different case
+            row("Mail", "me", "pw2"),   // same name, different password: keep
+            row("Bank", "me", "pw3"),
+            row("Bank", "me", "pw3"),   // repeated within the file
+        ];
+        let (kept, dropped) = without_duplicates([("Bank", "me", "pw3")], rows);
+        assert_eq!(dropped, 3);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].password, "pw1");
+        assert_eq!(kept[1].password, "pw2");
+    }
+
+    #[test]
+    fn reads_a_synthetic_kdbx() {
+        let bytes = include_bytes!("../tests/fixtures/synthetic.kdbx");
+        let (rows, skipped) = parse_kdbx(&mut &bytes[..], "kdbx-test-pass").unwrap();
+        assert_eq!(skipped, 1, "the entry with no password");
+        assert_eq!(rows.len(), 4);
+        let mail = rows.iter().find(|r| r.name == "KP Mail").unwrap();
+        assert_eq!(mail.username, "alice");
+        assert_eq!(mail.uri.as_deref(), Some("https://mail.example"));
+        assert_eq!(mail.notes.as_deref(), Some("synthetic note"));
+        assert!(mail.tags.is_none());
+        let authy = rows.iter().find(|r| r.name == "KP Authy").unwrap();
+        assert_eq!(authy.totp.as_deref(), Some("JBSWY3DPEHPK3PXP"));
+        let work = rows.iter().find(|r| r.name == "KP Work").unwrap();
+        assert_eq!(work.tags.as_deref(), Some("Work"));
+    }
+
+    #[test]
+    fn a_wrong_kdbx_password_gives_the_vague_error() {
+        let bytes = include_bytes!("../tests/fixtures/synthetic.kdbx");
+        let err = parse_kdbx(&mut &bytes[..], "nope").unwrap_err();
+        assert_eq!(err, "wrong password, or not a KDBX 4 file");
+    }
+
+    #[test]
+    fn vaultling_export_round_trips_the_category() {
+        let csv = "name,username,password,url,totp,notes,tags,kind\n\
+                   \"Mail\",\"me\",\"pw\",\"\",\"\",\"\",\"\",\"Email account\"\n\
+                   \"Alarm\",\"\",\"\",\"\",\"\",\"code 1234\",\"\",\"Secure note\"\n";
+        let (_, rows, skipped) = parse_counting(csv).unwrap();
+        assert_eq!(skipped, 0);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].kind, Some(crate::kind::Kind::Email));
+        assert_eq!(rows[1].kind, Some(crate::kind::Kind::SecureNote));
+        assert_eq!(rows[1].notes.as_deref(), Some("code 1234"));
+    }
+
+    #[test]
+    fn counts_the_rows_it_skips() {
+        let csv = "name,username,password,url\nA,u,pw,\nB,u,,\nC,u,,\n";
+        let (_, rows, skipped) = parse_counting(csv).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(skipped, 2);
     }
 
     #[test]

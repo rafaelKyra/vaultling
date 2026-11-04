@@ -17,8 +17,10 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// One row on the way out. Mirrors what `import::Incoming` reads back in, so a
-/// Vaultling export re-imports into Vaultling without loss.
+/// One row on the way out. Mirrors what `import::Incoming` reads back in. The
+/// CSV carries these columns plus the category; fields specific to a category
+/// (card number, host, port...) are not exported, so use the encrypted backup
+/// for a lossless copy.
 pub struct Outgoing {
     pub name: String,
     pub username: String,
@@ -27,6 +29,7 @@ pub struct Outgoing {
     pub totp: Option<String>,
     pub notes: Option<String>,
     pub tags: Option<String>,
+    pub kind: crate::kind::Kind,
 }
 
 fn quote(field: &str) -> String {
@@ -40,7 +43,7 @@ fn quote(field: &str) -> String {
 /// PLAINTEXT. Every password appears in the clear. The caller is responsible
 /// for telling the user before writing it and for choosing where it lands.
 pub fn to_csv(rows: &[Outgoing]) -> String {
-    let mut out = String::from("name,username,password,url,totp,notes,tags\n");
+    let mut out = String::from("name,username,password,url,totp,notes,tags,kind\n");
     for r in rows {
         out.push_str(&quote(&r.name));
         out.push(',');
@@ -55,6 +58,8 @@ pub fn to_csv(rows: &[Outgoing]) -> String {
         out.push_str(&quote(r.notes.as_deref().unwrap_or("")));
         out.push(',');
         out.push_str(&quote(r.tags.as_deref().unwrap_or("")));
+        out.push(',');
+        out.push_str(&quote(r.kind.label()));
         out.push('\n');
     }
     out
@@ -125,6 +130,7 @@ mod tests {
             totp: None,
             notes: notes.map(|s| s.into()),
             tags: None,
+            kind: crate::kind::Kind::Website,
         }
     }
 
@@ -147,6 +153,21 @@ mod tests {
             Some("he said \"hi\"\nsecond line"),
             "quotes and newlines must survive the round trip"
         );
+    }
+
+    #[test]
+    fn the_category_survives_a_round_trip_and_passwordless_entries_are_kept() {
+        let mut note = row("Alarm", "", Some("code 1234"));
+        note.kind = crate::kind::Kind::SecureNote;
+        let mut card = row("Visa", "4111", None);
+        card.kind = crate::kind::Kind::BankCard;
+        let csv = to_csv(&[note, card]);
+        let (source, back, skipped) = crate::import::parse_counting(&csv).unwrap();
+        assert_eq!(source, crate::import::Source::Vaultling);
+        assert_eq!(skipped, 0);
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[0].kind, Some(crate::kind::Kind::SecureNote));
+        assert_eq!(back[1].kind, Some(crate::kind::Kind::BankCard));
     }
 
     #[test]

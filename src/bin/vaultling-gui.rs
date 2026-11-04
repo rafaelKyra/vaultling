@@ -13,7 +13,9 @@ use eframe::egui;
 use rand_core::{OsRng, RngCore};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use vaultling::gui::design_system::{palette, set_palette};
+use vaultling::gui::design_system::{
+    palette, reduced_motion, set_high_contrast, set_palette, set_reduced_motion,
+};
 use vaultling::gui::layout::show_three_pane;
 use vaultling::key_lifecycle::{KeySession, MasterKey};
 use vaultling::kind::{self, Kind};
@@ -49,6 +51,7 @@ enum Panel {
     Export,
     History(i64),
     Trash,
+    Stats,
     Confirm(i64, String),
     ConfirmPurge(i64, String),
     ChangePass,
@@ -59,7 +62,94 @@ enum Panel {
 #[derive(PartialEq, Clone, Copy)]
 enum Sort {
     Name,
+    /// Most recently added first.
     Recent,
+    /// Most recently edited first.
+    Updated,
+    /// Grouped by category, then by name.
+    Category,
+}
+
+impl Sort {
+    fn label(self) -> &'static str {
+        match self {
+            Sort::Name => "A\u{2013}Z",
+            Sort::Recent => "Newest",
+            Sort::Updated => "Edited",
+            Sort::Category => "Category",
+        }
+    }
+    fn next(self) -> Sort {
+        match self {
+            Sort::Name => Sort::Recent,
+            Sort::Recent => Sort::Updated,
+            Sort::Updated => Sort::Category,
+            Sort::Category => Sort::Name,
+        }
+    }
+}
+
+fn sort_rows(rows: &mut [Row], sort: Sort) {
+    match sort {
+        Sort::Name => rows.sort_by_key(|r| r.name.to_lowercase()),
+        Sort::Recent => rows.sort_by_key(|r| std::cmp::Reverse(r.id)),
+        Sort::Updated => rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(b.id.cmp(&a.id))),
+        Sort::Category => rows.sort_by_key(|r| (r.kind.label().to_string(), r.name.to_lowercase())),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Bulk {
+    Trash,
+    Favorite(bool),
+}
+
+/// How many entries each category holds, largest first, empty ones omitted.
+/// "123456" -> "123 456": two groups, easier to read and to type.
+fn group_code(code: &str) -> String {
+    if code.len() == 6 && code.is_ascii() {
+        format!("{} {}", &code[..3], &code[3..])
+    } else {
+        code.to_string()
+    }
+}
+
+/// What the KeePass worker thread sends back: the parsed rows and the number
+/// skipped, or an error message.
+type KdbxJob = std::sync::mpsc::Receiver<Result<(Vec<vaultling::import::Incoming>, usize), String>>;
+
+/// The first-run walkthrough, one entry per step: title and body.
+const WELCOME: [(&str, &str); 3] = [
+    (
+        "Your vault is ready",
+        "Everything is stored encrypted on this machine and nowhere else. \
+         Sixteen categories keep logins, keys, cards, notes and recovery codes apart.",
+    ),
+    (
+        "Add your first entry",
+        "Pick what it is, give it a name and let Generate make a strong password. \
+         Already have a list? Import (CSV or KeePass) brings it in.",
+    ),
+    (
+        "How it protects you",
+        "Copied secrets are overwritten after 20 seconds. The vault locks after \
+         5 minutes idle, when minimised, or with Ctrl+L. Press ? any time for shortcuts.",
+    ),
+];
+
+/// The step after `step`, or `None` once the last one is done.
+fn welcome_next(step: usize) -> Option<usize> {
+    (step + 1 < WELCOME.len()).then_some(step + 1)
+}
+
+fn kind_counts(rows: &[Row]) -> Vec<(Kind, usize)> {
+    let mut map: std::collections::HashMap<Kind, usize> = Default::default();
+    for r in rows {
+        *map.entry(r.kind).or_insert(0) += 1;
+    }
+    let mut v: Vec<_> = map.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.label().cmp(b.0.label())));
+    v
 }
 
 /// One entry as the list needs it: the id for editing, plus decrypted fields.
@@ -143,6 +233,21 @@ struct App {
     filter: String,
     tag_filter: Option<String>,
     sort: Sort,
+    show_shortcuts: bool,
+    /// Multi-select mode for bulk actions, and the ids ticked in it.
+    selecting: bool,
+    ticked_ids: std::collections::HashSet<i64>,
+    high_contrast: bool,
+    reduce_motion: bool,
+    /// First-run walkthrough: the step being shown, if any, and whether it has
+    /// already been offered this session.
+    welcome_step: Option<usize>,
+    /// Result of a KeePass file being read on a worker thread.
+    kdbx_job: Option<KdbxJob>,
+    welcome_seen: bool,
+    /// Show live two-factor codes in the list rows. Off by default: a code
+    /// on screen is readable by anyone behind the user.
+    list_codes: bool,
     rows: Vec<Row>,
     open_entry: Option<i64>,
     reveal_password: bool,
@@ -202,6 +307,15 @@ impl Default for App {
             filter: String::new(),
             tag_filter: None,
             sort: Sort::Name,
+            show_shortcuts: false,
+            selecting: false,
+            ticked_ids: Default::default(),
+            high_contrast: false,
+            reduce_motion: false,
+            welcome_step: None,
+            kdbx_job: None,
+            welcome_seen: false,
+            list_codes: false,
             rows: Vec::new(),
             open_entry: None,
             reveal_password: false,
@@ -395,6 +509,31 @@ fn generate_password() -> String {
 ///
 /// Not a dictionary check — "Password1!" scores respectably here and is
 /// terrible — so the label always says "estimate".
+/// Overwrite decrypted entry and history text before dropping it, so a lock
+/// does not leave old passwords sitting in freed heap pages longer than needed.
+/// Best effort: copies made by egui or the allocator are outside our reach.
+fn wipe_secrets(rows: &mut Vec<Row>, history: &mut Vec<(i64, String, Option<String>)>) {
+    use zeroize::Zeroize;
+    for r in rows.iter_mut() {
+        r.password.zeroize();
+        r.username.zeroize();
+        if let Some(n) = r.notes.as_mut() {
+            n.zeroize();
+        }
+        if let Some(t) = r.totp.as_mut() {
+            t.zeroize();
+        }
+        for (_, v) in r.fields.iter_mut() {
+            v.zeroize();
+        }
+    }
+    rows.clear();
+    for h in history.iter_mut() {
+        h.1.zeroize();
+    }
+    history.clear();
+}
+
 fn strength(password: &str) -> (f32, &'static str, egui::Color32) {
     if password.is_empty() {
         return (0.0, "", palette().muted);
@@ -613,7 +752,13 @@ impl App {
         }
         self.db = None;
         self.vault_path = None;
-        self.rows.clear();
+        wipe_secrets(&mut self.rows, &mut self.history_rows);
+        self.trash_rows.clear();
+        self.tag_filter = None;
+        self.new_pass.clear();
+        self.new_pass_again.clear();
+        self.csv_path.clear();
+        self.export_path.clear();
         self.open_entry = None;
         self.reveal_password = false;
         self.reveal_notes = false;
@@ -627,6 +772,13 @@ impl App {
         self.change_new.clear();
         self.change_again.clear();
         self.panel = Panel::List;
+        self.show_shortcuts = false;
+        self.welcome_step = None;
+        self.kdbx_job = None; // an unfinished import is abandoned, not completed into a locked vault
+        self.welcome_seen = false;
+        self.list_codes = false;
+        self.selecting = false;
+        self.ticked_ids.clear();
         self.set(reason, Level::None);
     }
 
@@ -716,47 +868,127 @@ impl App {
         }
     }
 
+    /// Move every ticked entry to the trash (recoverable) or set/clear its
+    /// favourite flag.
+    fn bulk(&mut self, action: Bulk) {
+        let ids: Vec<i64> = self.ticked_ids.iter().copied().collect();
+        let Some(db) = self.db.as_ref() else {
+            return self.set("vault is locked", Level::Bad);
+        };
+        let mut done = 0usize;
+        for id in &ids {
+            let ok = match action {
+                Bulk::Trash => db.trash_entry(*id),
+                Bulk::Favorite(f) => db.set_favorite(*id, f),
+            };
+            if matches!(ok, Ok(true)) {
+                done += 1;
+            }
+        }
+        self.ticked_ids.clear();
+        if matches!(action, Bulk::Trash) {
+            self.open_entry = None;
+        }
+        self.reload();
+        let msg = match action {
+            Bulk::Trash => format!("{done} entries moved to trash"),
+            Bulk::Favorite(true) => format!("{done} entries marked favourite"),
+            Bulk::Favorite(false) => format!("{done} entries unmarked"),
+        };
+        self.set(msg, if done == ids.len() { Level::Ok } else { Level::Bad });
+    }
+
+    /// Start a KeePass import. The slow part (decrypting the file: Argon2 and
+    /// the XML) runs on a worker thread so the window keeps drawing; the rest
+    /// happens in `finish_kdbx` once the worker reports back.
     fn import_kdbx(&mut self) {
         let path = self.import_path.trim().to_string();
         if path.is_empty() {
             return self.set("Give the path to a .kdbx file", Level::Bad);
         }
-        let pass = self.import_pass.clone();
-        self.import_pass.clear();
-        let (Some(db), Some(session)) = (self.db.as_ref(), self.session.as_ref()) else {
+        if self.db.is_none() {
             return self.set("vault is locked", Level::Bad);
-        };
+        }
+        if self.kdbx_job.is_some() {
+            return self.set("An import is already running", Level::Bad);
+        }
+        let mut pass = self.import_pass.clone();
+        self.import_pass.clear();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use zeroize::Zeroize;
+            let result = std::fs::File::open(&path)
+                .map_err(|_| "cannot open that file".to_string())
+                .and_then(|mut f| vaultling::import::parse_kdbx(&mut f, &pass));
+            pass.zeroize();
+            let _ = tx.send(result);
+        });
+        self.kdbx_job = Some(rx);
+        self.set("Reading the KeePass file…", Level::None);
+    }
 
-        let result = (|| -> Result<(usize, usize), String> {
-            let mut file = std::fs::File::open(&path).map_err(|_| "cannot open that file")?;
-            let key = keepass::DatabaseKey::new().with_password(&pass);
-            let kdbx = keepass::Database::open(&mut file, key)
-                .map_err(|_| "wrong password, or not a KDBX 4 file")?;
-            let (mut ok, mut skipped) = (0usize, 0usize);
-            for entry in kdbx.iter_all_entries() {
-                match (entry.get_title(), entry.get_password()) {
-                    (Some(title), Some(password)) => {
-                        let user = entry.get_username().unwrap_or("");
-                        let url = entry.get("URL").filter(|u| !u.is_empty());
-                        // KeePass stores TOTP under "otp" as an otpauth URI;
-                        // normalize_secret handles both that and a bare secret.
-                        let otp = entry.get("otp").and_then(totp::normalize_secret);
-                        db.insert_entry(session, title, user, password, url, otp.as_deref())
-                            .map_err(|e| e.to_string())?;
-                        ok += 1;
-                    }
-                    _ => skipped += 1,
-                }
+    /// Poll the worker; when it is done, insert what it found.
+    fn poll_kdbx(&mut self) {
+        let Some(rx) = self.kdbx_job.as_ref() else { return };
+        let parsed = match rx.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(_) => Err("the import stopped unexpectedly".to_string()),
+        };
+        self.kdbx_job = None;
+        let (Some(db), Some(session)) = (self.db.as_ref(), self.session.as_ref()) else {
+            return;
+        };
+        let mut existing: Vec<(String, String, String)> = self
+            .rows
+            .iter()
+            .map(|r| (r.name.clone(), r.username.clone(), r.password.clone()))
+            .collect();
+        let result = (|| -> Result<(usize, usize, usize), String> {
+            let (rows, skipped) = parsed?;
+            let (rows, dupes) = vaultling::import::without_duplicates(
+                existing.iter().map(|(n, u, p)| (n.as_str(), u.as_str(), p.as_str())),
+                rows,
+            );
+            for r in &rows {
+                db.insert_draft(
+                    session,
+                    &EntryDraft {
+                        name: &r.name,
+                        username: &r.username,
+                        password: &r.password,
+                        uri: r.uri.as_deref(),
+                        totp_secret: r.totp.as_deref(),
+                        notes: r.notes.as_deref(),
+                        tags: r.tags.as_deref(),
+                        kind: r.kind.unwrap_or_default(),
+                        ..EntryDraft::default()
+                    },
+                )
+                .map_err(|e| e.to_string())?;
             }
-            Ok((ok, skipped))
+            Ok((rows.len(), skipped, dupes))
         })();
+        {
+            use zeroize::Zeroize;
+            for e in existing.iter_mut() {
+                e.2.zeroize();
+            }
+        }
 
         match result {
-            Ok((ok, skipped)) => {
+            Ok((ok, skipped, dupes)) => {
                 self.import_path.clear();
                 self.reload();
                 self.panel = Panel::List;
-                self.set(format!("Imported {ok} entries, skipped {skipped}"), Level::Ok);
+                let mut note = String::new();
+                if skipped > 0 {
+                    note.push_str(&format!(", {skipped} skipped (no title or password)"));
+                }
+                if dupes > 0 {
+                    note.push_str(&format!(", {dupes} already in the vault"));
+                }
+                self.set(format!("Imported {ok} entries{note}"), Level::Ok);
             }
             Err(why) => self.set(why, Level::Bad),
         }
@@ -944,15 +1176,24 @@ fn form<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     // pinned to the left edge with a third of the window empty beside it,
     // which looks like a layout that ran out rather than one that was chosen.
     let pad = ((ui.available_width() - width) / 2.0).max(0.0);
-    ui.horizontal(|ui| {
-        ui.add_space(pad);
-        ui.vertical(|ui| {
-            ui.set_max_width(width);
-            card(ui, add)
+    // Scrollable: a tall form (the editor with sixteen categories and notes)
+    // is taller than the window, and without this its Save button is simply
+    // out of reach.
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            // An explicit rectangle rather than a horizontal layout: a
+            // horizontal sizes itself to its contents' height, which hands any
+            // scroll area inside the card (trash, history) almost no height.
+            let avail = ui.available_rect_before_wrap();
+            let rect = egui::Rect::from_min_size(
+                avail.min + egui::vec2(pad, 0.0),
+                egui::vec2(width, avail.height()),
+            );
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| card(ui, add))
+                .inner
         })
         .inner
-    })
-    .inner
 }
 
 /// A raised surface.
@@ -1096,6 +1337,10 @@ fn logo(ui: &mut egui::Ui, size: f32) {
 /// Everything here is arithmetic on positions and opacity — no assets, no
 /// decoding, nothing read from disk.
 fn cipher_rain(ui: &mut egui::Ui, rect: egui::Rect, t: f64, intensity: f32) {
+    // Decoration only: skipped entirely when the user asked for less motion.
+    if reduced_motion() {
+        return;
+    }
     const COLS: usize = 7;
     const GLYPHS: &[u8] = b"0123456789ABCDEF";
     let p = ui.painter().with_clip_rect(rect);
@@ -1571,6 +1816,8 @@ fn icon_button(ui: &mut egui::Ui, glyph: Icon, text: &str) -> bool {
 
     let rect = inner.rect.expand2(egui::vec2(0.0, 5.0));
     let click = ui.interact(rect, id, egui::Sense::click());
+    // Screen readers get the label; the glyph is decoration.
+    click.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, text));
     let fill = if click.hovered() {
         palette().accent.linear_multiply(0.45)
     } else {
@@ -1651,6 +1898,13 @@ fn nav_row(
     const H: f32 = 27.0;
     let w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, H), egui::Sense::click());
+    resp.widget_info(|| {
+        let label = match count {
+            Some(n) => format!("{text}, {n}"),
+            None => text.to_string(),
+        };
+        egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, label)
+    });
     let p = ui.painter();
 
     if selected {
@@ -1768,14 +2022,17 @@ impl eframe::App for App {
         // timer rather than only on input. Slower when locked: nothing there
         // needs sixty frames a second, and a vault should not spin a laptop fan
         // while it sits waiting for a passphrase.
-        ctx.request_repaint_after(Duration::from_millis(if self.db.is_some() {
-            500
-        } else {
-            50
-        }));
+        ctx.request_repaint_after(Duration::from_millis(
+            if self.db.is_some() || reduced_motion() { 500 } else { 50 },
+        ));
 
         if ctx.input(|i| !i.events.is_empty() || i.pointer.velocity() != egui::Vec2::ZERO) {
             self.last_input = Instant::now();
+        }
+
+        self.poll_kdbx();
+        if self.kdbx_job.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
 
         // Clipboard hygiene: overwrite rather than clear. An empty clipboard is
@@ -1836,6 +2093,11 @@ impl eframe::App for App {
                     // chosen per theme is exactly the kind of thing that goes
                     // wrong in only one of them, and stays wrong because only
                     // the other one is ever looked at.
+                    if std::env::var("VAULTLING_SHOT_HC").is_ok() {
+                        self.high_contrast = true;
+                        set_high_contrast(true);
+                        apply_theme(ctx, std::env::var("VAULTLING_SHOT_LIGHT").is_ok());
+                    }
                     if std::env::var("VAULTLING_SHOT_LIGHT").is_ok() {
                         self.light = true;
                         apply_theme(ctx, true);
@@ -1851,6 +2113,7 @@ impl eframe::App for App {
                             "settings" => Panel::Settings,
                             "help" => Panel::Help,
                             "trash" => Panel::Trash,
+                            "stats" => Panel::Stats,
                             _ => Panel::List,
                         };
                         // VAULTLING_SHOT_KIND=<number> picks a category: which
@@ -1936,18 +2199,59 @@ impl eframe::App for App {
         // Keyboard first: a password manager is used dozens of times a day, and
         // reaching for the mouse each time is what makes people stop using one.
         if self.db.is_some() {
-            let (lock, copy, close, find) = ctx.input(|i| {
+            // Plain-key shortcuts must never fire while the user is typing: a
+            // `/` in a URL field would otherwise jump to search, and Ctrl+C in
+            // a text box would overwrite the selection they meant to copy with
+            // the entry's password.
+            let typing = ctx.wants_keyboard_input();
+            let (lock, copy, close, find, help, down, up) = ctx.input(|i| {
+                let plain = !typing && !i.modifiers.any();
                 (
                     i.key_pressed(egui::Key::L) && i.modifiers.ctrl,
-                    i.key_pressed(egui::Key::C) && i.modifiers.ctrl,
+                    // egui-winit turns Ctrl+C into `Event::Copy` and emits no key
+                    // press for it, so the key alone never fires.
+                    (i.key_pressed(egui::Key::C) && i.modifiers.ctrl
+                        || i.events.iter().any(|e| matches!(e, egui::Event::Copy)))
+                        && !typing,
                     i.key_pressed(egui::Key::Escape),
-                    i.key_pressed(egui::Key::Slash) && !i.modifiers.ctrl,
+                    i.key_pressed(egui::Key::Slash) && plain,
+                    // `?` arrives as a text event, not a key press, on most layouts.
+                    !typing
+                        && i.events
+                            .iter()
+                            .any(|e| matches!(e, egui::Event::Text(t) if t == "?")),
+                    (i.key_pressed(egui::Key::ArrowDown) || i.key_pressed(egui::Key::J)) && plain,
+                    (i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::K)) && plain,
                 )
             });
+            if help {
+                self.show_shortcuts = !self.show_shortcuts;
+            }
+            if (down || up) && self.panel == Panel::List && !self.selecting {
+                let mut order = self.matching_rows();
+                sort_rows(&mut order, self.sort);
+                if !order.is_empty() {
+                    let at = self.open_entry.and_then(|id| order.iter().position(|r| r.id == id));
+                    let to = match (at, down) {
+                        (None, _) => 0,
+                        (Some(i), true) => (i + 1).min(order.len() - 1),
+                        (Some(i), false) => i.saturating_sub(1),
+                    };
+                    self.open_entry = Some(order[to].id);
+                    self.reveal_password = false;
+                    self.reveal_notes = false;
+                    self.revealed_fields.clear();
+                }
+            }
             if lock {
                 self.lock("Locked");
             } else if close {
-                if self.panel != Panel::List {
+                if self.show_shortcuts {
+                    self.show_shortcuts = false;
+                } else if self.selecting {
+                    self.selecting = false;
+                    self.ticked_ids.clear();
+                } else if self.panel != Panel::List {
                     self.panel = Panel::List;
                 } else if self.open_entry.is_some() {
                     self.open_entry = None;
@@ -1970,6 +2274,90 @@ impl eframe::App for App {
         // different shapes. Only the last one earns three panes; forcing the
         // others into it would put an empty sidebar next to a password prompt.
         let browsing = self.db.is_some() && self.panel == Panel::List;
+
+        // Offered once per unlock, and only when there is nothing in the vault
+        // yet: a walkthrough over a vault of forty entries is just in the way.
+        if self.db.is_some() && !self.welcome_seen {
+            self.welcome_seen = true;
+            if self.rows.is_empty() {
+                self.welcome_step = Some(0);
+            }
+        }
+        if let (Some(step), true) = (self.welcome_step, self.db.is_some()) {
+            let (title, body) = WELCOME[step.min(WELCOME.len() - 1)];
+            let mut done = false;
+            let mut go_add = false;
+            let mut next = None;
+            egui::Window::new(format!("Welcome — step {} of {}", step + 1, WELCOME.len()))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .default_width(380.0)
+                .show(ctx, |ui| {
+                    ui.label(egui::RichText::new(title).size(17.0).strong());
+                    ui.add_space(6.0);
+                    ui.add(egui::Label::new(egui::RichText::new(body).color(palette().muted)).wrap());
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if step > 0 && ui.button("Back").clicked() {
+                            next = Some(step - 1);
+                        }
+                        match welcome_next(step) {
+                            Some(n) => {
+                                if primary(ui, "Next") {
+                                    next = Some(n);
+                                }
+                            }
+                            None => {
+                                if primary(ui, "Add an entry") {
+                                    go_add = true;
+                                }
+                            }
+                        }
+                        if ui.button("Skip").clicked() {
+                            done = true;
+                        }
+                    });
+                });
+            if go_add {
+                self.draft = Draft::default();
+                self.panel = Panel::Editor;
+                self.open_entry = None;
+                self.welcome_step = None;
+            } else if done {
+                self.welcome_step = None;
+            } else if let Some(n) = next {
+                self.welcome_step = Some(n);
+            }
+        }
+
+        if self.show_shortcuts && self.db.is_some() {
+            let mut open = true;
+            egui::Window::new("Keyboard shortcuts")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    egui::Grid::new("shortcuts").num_columns(2).spacing([24.0, 6.0]).show(ui, |ui| {
+                        for (k, what) in [
+                            ("/", "Search"),
+                            ("\u{2193} / j,  \u{2191} / k", "Next / previous entry"),
+                            ("Ctrl+C", "Copy the open entry's secret"),
+                            ("Ctrl+L", "Lock now"),
+                            ("Esc", "Close help, selection or panel"),
+                            ("?", "Show or hide this list"),
+                        ] {
+                            ui.label(egui::RichText::new(k).monospace().color(palette().accent));
+                            ui.label(what);
+                            ui.end_row();
+                        }
+                    });
+                });
+            if !open {
+                self.show_shortcuts = false;
+            }
+        }
 
         // No title bar on the lock screen: the hero below already carries the
         // mark and the name, and showing both put the same two lines twice
@@ -2020,7 +2408,9 @@ impl eframe::App for App {
                             let t = ui.input(|i| i.time);
                             let rect = ui.available_rect_before_wrap();
                             cipher_rain(ui, rect, t, 0.16);
-                            ui.ctx().request_repaint_after(Duration::from_millis(60));
+                            if !reduced_motion() {
+                                ui.ctx().request_repaint_after(Duration::from_millis(60));
+                            }
                             ui.add_space(ui.available_height() * 0.30);
                             ui.vertical_centered(|ui| {
                                 logo(ui, 46.0);
@@ -2041,6 +2431,26 @@ impl eframe::App for App {
                     }
                 },
             );
+        } else {
+            // Everything that is not the browsing list: the lock screen, vault
+            // creation, the editor and every other form. One full-width pane.
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::none()
+                        .fill(palette().bg)
+                        .inner_margin(egui::Margin::symmetric(16.0, 14.0)),
+                )
+                .show(ctx, |ui| {
+                    if self.db.is_some() {
+                        self.unlocked(ui);
+                    } else if self.show_help_locked {
+                        self.help_view(ui);
+                    } else if self.creating {
+                        self.create_view(ui);
+                    } else {
+                        self.locked(ui);
+                    }
+                });
         }
     }
 }
@@ -2696,6 +3106,7 @@ impl App {
             Panel::Export => return self.export_view(ui),
             Panel::History(id) => return self.history_view(ui, id),
             Panel::Trash => return self.trash_view(ui),
+            Panel::Stats => return self.stats_view(ui),
             Panel::Settings => return self.settings_view(ui),
             Panel::Help => return self.help_view(ui),
             Panel::List => {}
@@ -2725,6 +3136,10 @@ impl App {
                 }
             });
             ui.menu_button("More  v", |ui| {
+                if ui.button("Vault statistics…").clicked() {
+                    self.panel = Panel::Stats;
+                    ui.close_menu();
+                }
                 if ui.button("Export & backup…").clicked() {
                     self.panel = Panel::Export;
                     ui.close_menu();
@@ -2756,24 +3171,61 @@ impl App {
             // scope inside a wrapped row claims all the width still going,
             // leaving the button before it whatever is left — which is how
             // "More" spent two sessions being drawn as "Mor".
-            let t = match self.sort {
-                Sort::Name => "A–Z",
-                Sort::Recent => "Newest",
-            };
-            if ui.button(t).clicked() {
-                self.sort = match self.sort {
-                    Sort::Name => Sort::Recent,
-                    Sort::Recent => Sort::Name,
-                };
+            if ui
+                .button(self.sort.label())
+                .on_hover_text("Change the order of the list")
+                .clicked()
+            {
+                self.sort = self.sort.next();
+            }
+            if ui
+                .selectable_label(self.selecting, "Select")
+                .on_hover_text("Tick several entries to act on them together")
+                .clicked()
+            {
+                self.selecting = !self.selecting;
+                self.ticked_ids.clear();
             }
         });
+        if self.selecting {
+            let visible: Vec<i64> = self.matching_rows().iter().map(|r| r.id).collect();
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("{} selected", self.ticked_ids.len()))
+                        .color(palette().muted),
+                );
+                if ui.small_button("All shown").clicked() {
+                    self.ticked_ids.extend(visible.iter().copied());
+                }
+                if ui.small_button("None").clicked() {
+                    self.ticked_ids.clear();
+                }
+                let any = !self.ticked_ids.is_empty();
+                if ui.add_enabled(any, egui::Button::new("\u{2605}").small()).on_hover_text("Mark as favourite").clicked() {
+                    self.bulk(Bulk::Favorite(true));
+                }
+                if ui.add_enabled(any, egui::Button::new("\u{2606}").small()).on_hover_text("Remove from favourites").clicked() {
+                    self.bulk(Bulk::Favorite(false));
+                }
+                if ui
+                    .add_enabled(
+                        any,
+                        egui::Button::new(
+                            egui::RichText::new("Move to trash").color(palette().danger),
+                        )
+                        .small(),
+                    )
+                    .on_hover_text("Recoverable from the trash")
+                    .clicked()
+                {
+                    self.bulk(Bulk::Trash);
+                }
+            });
+        }
         ui.add_space(10.0);
 
         let mut shown = self.matching_rows();
-        match self.sort {
-            Sort::Name => shown.sort_by_key(|r| r.name.to_lowercase()),
-            Sort::Recent => shown.sort_by(|a, b| b.id.cmp(&a.id)),
-        }
+        sort_rows(&mut shown, self.sort);
 
         let total = self.rows.len();
         card(ui, |ui| {
@@ -2796,7 +3248,22 @@ impl App {
                         .size(12.5)
                         .color(palette().muted),
                     );
-                    ui.add_space(16.0);
+                    ui.add_space(12.0);
+                    for (n, step) in [
+                        "Add your first entry — pick what it is, and Generate makes a strong password.",
+                        "Bring the rest with Import (CSV or KeePass).",
+                        "Press ? any time for shortcuts. The vault locks itself after 5 minutes idle.",
+                    ]
+                    .iter()
+                    .enumerate()
+                    {
+                        ui.label(
+                            egui::RichText::new(format!("{}.  {step}", n + 1))
+                                .size(12.0)
+                                .color(palette().muted),
+                        );
+                    }
+                    ui.add_space(14.0);
                     ui.horizontal(|ui| {
                         ui.add_space(ui.available_width() / 2.0 - 130.0);
                         if primary(ui, "Add an entry") {
@@ -2818,7 +3285,8 @@ impl App {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let last = shown.len().saturating_sub(1);
                 for (i, row) in shown.iter().enumerate() {
-                    let selected = self.open_entry == Some(row.id);
+                    let ticked = self.selecting && self.ticked_ids.contains(&row.id);
+                    let selected = if self.selecting { ticked } else { self.open_entry == Some(row.id) };
                     // The whole row is the target. A dedicated Open button asks
                     // the user to aim at 60 pixels when 700 were available.
                     // A Frame, not a hand-painted rectangle. The first attempt
@@ -2836,15 +3304,23 @@ impl App {
                         .rounding(egui::Rounding::same(9.0))
                         .inner_margin(egui::Margin::symmetric(8.0, 6.0))
                         .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
                             ui.horizontal(|ui| {
+                                if self.selecting {
+                                    let mark = if ticked { "\u{2611}" } else { "\u{2610}" };
+                                    ui.label(egui::RichText::new(mark).size(16.0).color(palette().accent));
+                                }
                                 avatar(ui, &row.name, 30.0);
                                 ui.add_space(4.0);
                                 ui.vertical(|ui| {
-                                    ui.label(
-                                        egui::RichText::new(&row.name)
-                                            .size(14.0)
-                                            .strong()
-                                            .color(if selected { palette().accent } else { palette().text }),
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&row.name)
+                                                .size(14.0)
+                                                .strong()
+                                                .color(if selected { palette().accent } else { palette().text }),
+                                        )
+                                        .truncate(),
                                     );
                                     // The category on the second line, as a
                                     // shape and a word. Without it a mixed
@@ -2861,8 +3337,22 @@ impl App {
                                         if row.totp.is_some() && row.kind != Kind::Authenticator {
                                             sub.push_str("  ·  2FA");
                                         }
-                                        ui.label(
-                                            egui::RichText::new(sub).size(11.0).color(palette().muted),
+                                        if self.list_codes {
+                                            if let Some(code) = row
+                                                .totp
+                                                .as_deref()
+                                                .and_then(|sec| totp::code_now(sec).ok())
+                                            {
+                                                sub.push_str("  ·  ");
+                                                sub.push_str(&group_code(&code));
+                                                sub.push_str(&format!(" ({}s)", totp::seconds_remaining()));
+                                            }
+                                        }
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(sub).size(11.0).color(palette().muted),
+                                            )
+                                            .truncate(),
                                         );
                                     });
                                 });
@@ -2870,11 +3360,27 @@ impl App {
                         })
                         .response
                         .interact(egui::Sense::click());
+                    resp.widget_info(|| {
+                        let mut label = format!("{}, {}", row.name, row.kind.label());
+                        if self.selecting {
+                            label.push_str(if ticked { ", ticked" } else { ", not ticked" });
+                        }
+                        egui::WidgetInfo::selected(
+                            egui::WidgetType::SelectableLabel,
+                            true,
+                            selected,
+                            label,
+                        )
+                    });
 
                     if resp.hovered() {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
-                    if resp.clicked() {
+                    if resp.clicked() && self.selecting {
+                        if !self.ticked_ids.remove(&row.id) {
+                            self.ticked_ids.insert(row.id);
+                        }
+                    } else if resp.clicked() {
                         self.open_entry = Some(row.id);
                         self.reveal_password = false;
                         self.reveal_notes = false;
@@ -3188,6 +3694,14 @@ impl App {
                         egui::vec2(CELL, 34.0),
                         egui::Sense::click(),
                     );
+                    resp.widget_info(|| {
+                        egui::WidgetInfo::selected(
+                            egui::WidgetType::RadioButton,
+                            true,
+                            on,
+                            k.label(),
+                        )
+                    });
                     let hot = resp.hovered();
                     let fill = if on {
                         tint.linear_multiply(0.30)
@@ -3693,25 +4207,58 @@ impl App {
         let (Some(db), Some(session)) = (self.db.as_ref(), self.session.as_ref()) else {
             return self.set("vault is locked", Level::Bad);
         };
-        let result = (|| -> Result<(String, usize), String> {
+        let mut existing: Vec<(String, String, String)> = self
+            .rows
+            .iter()
+            .map(|r| (r.name.clone(), r.username.clone(), r.password.clone()))
+            .collect();
+        let result = (|| -> Result<(String, usize, usize, usize), String> {
             let text = std::fs::read_to_string(&path).map_err(|_| "cannot read that file")?;
-            let (source, rows) = vaultling::import::parse(&text).map_err(|e| e.to_string())?;
+            let (source, rows, skipped) =
+                vaultling::import::parse_counting(&text).map_err(|e| e.to_string())?;
+            let (rows, dupes) = vaultling::import::without_duplicates(
+                existing.iter().map(|(n, u, p)| (n.as_str(), u.as_str(), p.as_str())),
+                rows,
+            );
             for r in &rows {
-                db.insert_entry_full(
-                    session, &r.name, &r.username, &r.password,
-                    r.uri.as_deref(), r.totp.as_deref(),
-                    r.notes.as_deref(), r.tags.as_deref(),
+                db.insert_draft(
+                    session,
+                    &EntryDraft {
+                        name: &r.name,
+                        username: &r.username,
+                        password: &r.password,
+                        uri: r.uri.as_deref(),
+                        totp_secret: r.totp.as_deref(),
+                        notes: r.notes.as_deref(),
+                        tags: r.tags.as_deref(),
+                        kind: r.kind.unwrap_or_default(),
+                        ..EntryDraft::default()
+                    },
                 )
                 .map_err(|e| e.to_string())?;
             }
-            Ok((source.name().to_string(), rows.len()))
+            Ok((source.name().to_string(), rows.len(), skipped, dupes))
         })();
+        {
+            // The comparison copies are decrypted passwords; overwrite them.
+            use zeroize::Zeroize;
+            for e in existing.iter_mut() {
+                e.2.zeroize();
+            }
+        }
         match result {
-            Ok((source, n)) => {
+            Ok((source, n, skipped, dupes)) => {
                 self.csv_path.clear();
                 self.reload();
                 self.panel = Panel::List;
-                self.set(format!("Imported {n} entries from {source}"), Level::Ok);
+                let mut note = String::new();
+                if skipped > 0 {
+                    note.push_str(&format!(", {skipped} skipped (no password)"));
+                }
+                if dupes > 0 {
+                    note.push_str(&format!(", {dupes} already in the vault"));
+                }
+                self.set(format!("Imported {n} entries from {source}{note}"), Level::Ok);
             }
             Err(why) => self.set(why, Level::Bad),
         }
@@ -3800,6 +4347,7 @@ impl App {
                 totp: r.totp.clone(),
                 notes: r.notes.clone(),
                 tags: r.tags.clone(),
+                kind: r.kind,
             })
             .collect();
         let n = rows.len();
@@ -4087,6 +4635,56 @@ impl App {
         });
     }
 
+    fn stats_view(&mut self, ui: &mut egui::Ui) {
+        let report = self.security_report();
+        let total = self.rows.len();
+        let with_2fa = self.rows.iter().filter(|r| r.totp.is_some()).count();
+        let favs = self.rows.iter().filter(|r| r.favorite).count();
+        let counts = kind_counts(&self.rows);
+        form(ui, |ui| {
+            ui.label(egui::RichText::new("Vault statistics").size(17.0).strong());
+            ui.add_space(10.0);
+            egui::Grid::new("stats").num_columns(2).spacing([24.0, 6.0]).show(ui, |ui| {
+                for (k, v) in [
+                    ("Entries", total.to_string()),
+                    ("Health score", format!("{} / 100", report.score)),
+                    ("Weak passwords", report.weak.to_string()),
+                    ("Reused passwords", report.reused.to_string()),
+                    ("Not changed in a year", report.stale.to_string()),
+                    ("Expired", report.expired.to_string()),
+                    ("With two-factor", with_2fa.to_string()),
+                    ("Favourites", favs.to_string()),
+                ] {
+                    ui.label(egui::RichText::new(k).color(palette().muted));
+                    ui.label(egui::RichText::new(v).strong());
+                    ui.end_row();
+                }
+            });
+            ui.add_space(14.0);
+            label(ui, "BY CATEGORY");
+            let max = counts.iter().map(|(_, n)| *n).max().unwrap_or(1).max(1);
+            for (kind, n) in &counts {
+                ui.horizontal(|ui| {
+                    icon(ui, kind_icon(*kind), 12.0, kind_color(*kind));
+                    ui.add_sized([130.0, 16.0], egui::Label::new(kind.label()).truncate());
+                    ui.add(
+                        egui::ProgressBar::new(*n as f32 / max as f32)
+                            .desired_width(140.0)
+                            .fill(kind_color(*kind)),
+                    );
+                    ui.label(n.to_string());
+                });
+            }
+            if counts.is_empty() {
+                ui.label(egui::RichText::new("Nothing here yet.").color(palette().muted));
+            }
+            ui.add_space(14.0);
+            if ui.button("Back").clicked() {
+                self.panel = Panel::List;
+            }
+        });
+    }
+
     fn settings_view(&mut self, ui: &mut egui::Ui) {
         form(ui, |ui| {
             ui.label(egui::RichText::new("Settings").size(17.0).strong());
@@ -4138,6 +4736,28 @@ impl App {
             {
                 apply_theme(ui.ctx(), self.light);
             }
+
+            if ui
+                .checkbox(&mut self.high_contrast, "High contrast")
+                .on_hover_text("Stronger text and borders, for low vision or bright rooms")
+                .changed()
+            {
+                set_high_contrast(self.high_contrast);
+                apply_theme(ui.ctx(), self.light);
+            }
+
+            if ui
+                .checkbox(&mut self.reduce_motion, "Reduce motion")
+                .on_hover_text("Stops the falling-character animation and slows redraws")
+                .changed()
+            {
+                set_reduced_motion(self.reduce_motion);
+                ui.ctx().style_mut(|st| {
+                    st.animation_time = if self.reduce_motion { 0.0 } else { 1.0 / 12.0 };
+                });
+            }
+            ui.checkbox(&mut self.list_codes, "Show two-factor codes in the list")
+                .on_hover_text("Visible to anyone who can see your screen. Resets when you lock.");
 
             ui.add_space(16.0);
             label(ui, "RECENT ACTIVITY");
@@ -4285,7 +4905,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([980.0, 820.0])
-            .with_min_inner_size([620.0, 620.0])
+            .with_min_inner_size([760.0, 600.0])
             .with_title("Vaultling"),
         ..Default::default()
     };
@@ -4298,4 +4918,157 @@ fn main() -> eframe::Result {
             Ok(Box::new(App::default()))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(id: i64, name: &str, kind: Kind, updated_at: i64) -> Row {
+        Row {
+            id,
+            favorite: false,
+            updated_at,
+            name: name.into(),
+            username: String::new(),
+            uri: None,
+            totp: None,
+            tags: None,
+            notes: None,
+            password: String::new(),
+            kind,
+            fields: vec![],
+        }
+    }
+
+    fn names(rows: &[Row]) -> Vec<&str> {
+        rows.iter().map(|r| r.name.as_str()).collect()
+    }
+
+    /// Names AccessKit exposes for the nodes of one frame.
+    fn accessible_labels(run: impl FnOnce(&mut egui::Ui)) -> Vec<String> {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0))),
+            ..Default::default()
+        };
+        let mut run = Some(run);
+        let out = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                if let Some(f) = run.take() {
+                    f(ui);
+                }
+            });
+        });
+        let update = out.platform_output.accesskit_update.expect("accesskit enabled");
+        update
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| node.name().map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn icon_buttons_have_an_accessible_name() {
+        let labels = accessible_labels(|ui| {
+            icon_button(ui, Icon::Plus, "Add");
+        });
+        assert!(labels.iter().any(|l| l == "Add"), "{labels:?}");
+    }
+
+    #[test]
+    fn category_rows_are_named_with_their_count() {
+        let labels = accessible_labels(|ui| {
+            nav_row(ui, None, "Website", Some(4), false, palette().accent, 0.0, false);
+        });
+        assert!(labels.iter().any(|l| l == "Website, 4"), "{labels:?}");
+    }
+
+    #[test]
+    fn the_walkthrough_has_a_finite_number_of_steps() {
+        let mut step = 0;
+        let mut seen = 1;
+        while let Some(n) = welcome_next(step) {
+            step = n;
+            seen += 1;
+        }
+        assert_eq!(seen, WELCOME.len());
+        assert!(WELCOME.iter().all(|(t, b)| !t.is_empty() && !b.is_empty()));
+    }
+
+    #[test]
+    fn group_code_splits_six_digits_only() {
+        assert_eq!(group_code("123456"), "123 456");
+        assert_eq!(group_code("12345678"), "12345678");
+        assert_eq!(group_code(""), "");
+    }
+
+    #[test]
+    fn every_sort_order_is_deterministic() {
+        let mut rows = vec![
+            row(1, "beta", Kind::Website, 30),
+            row(2, "Alpha", Kind::Email, 10),
+            row(3, "gamma", Kind::Website, 20),
+        ];
+        sort_rows(&mut rows, Sort::Name);
+        assert_eq!(names(&rows), ["Alpha", "beta", "gamma"]);
+        sort_rows(&mut rows, Sort::Recent);
+        assert_eq!(names(&rows), ["gamma", "Alpha", "beta"]);
+        sort_rows(&mut rows, Sort::Updated);
+        assert_eq!(names(&rows), ["beta", "gamma", "Alpha"]);
+        sort_rows(&mut rows, Sort::Category);
+        let kinds: Vec<_> = rows.iter().map(|r| r.kind.label()).collect();
+        let mut sorted = kinds.clone();
+        sorted.sort();
+        assert_eq!(kinds, sorted);
+    }
+
+    #[test]
+    fn sort_cycle_visits_every_mode_and_returns() {
+        let mut s = Sort::Name;
+        let mut seen = vec![s.label()];
+        for _ in 0..3 {
+            s = s.next();
+            seen.push(s.label());
+        }
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 4);
+        assert!(s.next() == Sort::Name);
+    }
+
+    #[test]
+    fn kind_counts_are_largest_first_and_skip_empty() {
+        let rows = vec![
+            row(1, "a", Kind::Email, 0),
+            row(2, "b", Kind::Website, 0),
+            row(3, "c", Kind::Website, 0),
+        ];
+        let c = kind_counts(&rows);
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[0], (Kind::Website, 2));
+        assert!(kind_counts(&[]).is_empty());
+    }
+
+    #[test]
+    fn wipe_secrets_empties_rows_and_history() {
+        let mut rows = vec![Row {
+            id: 1,
+            favorite: false,
+            updated_at: 0,
+            name: "n".into(),
+            username: "u".into(),
+            uri: None,
+            totp: Some("JBSWY3DPEHPK3PXP".into()),
+            tags: None,
+            notes: Some("note".into()),
+            password: "synthetic-pw".into(),
+            kind: Kind::Website,
+            fields: vec![("k".into(), "v".into())],
+        }];
+        let mut history = vec![(1, "old-synthetic-pw".to_string(), None)];
+        wipe_secrets(&mut rows, &mut history);
+        assert!(rows.is_empty() && history.is_empty());
+    }
 }
