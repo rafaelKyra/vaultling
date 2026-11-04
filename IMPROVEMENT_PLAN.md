@@ -71,10 +71,10 @@ Legend: done / partial / missing. Evidence is in `src/bin/vaultling-gui.rs` unle
 | Entry types / categories (16 kinds) | done | `vaultling::kind` |
 | Tags, favourites, sort | done | name, newest, edited, category |
 | Multi-select / bulk actions | done | Select mode: favourite, move to trash |
-| TOTP in detail with countdown | done | detail pane; not shown in list rows |
+| TOTP in detail with countdown | done | detail pane; optional in list rows (Settings, off by default) |
 | Password history | done | `history_rows` |
 | Stats dashboard, high contrast | done | `stats_view`, `HC_*` palettes |
-| Onboarding wizard | missing | only the empty-vault state |
+| Onboarding wizard | partial | three-step hint in the empty-vault state; no wizard |
 
 Implementation order: finish visual foundation and navigation (rows marked
 partial in the first half of the table) before any new feature.

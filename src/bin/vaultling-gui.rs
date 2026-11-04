@@ -103,6 +103,15 @@ enum Bulk {
 }
 
 /// How many entries each category holds, largest first, empty ones omitted.
+/// "123456" -> "123 456": two groups, easier to read and to type.
+fn group_code(code: &str) -> String {
+    if code.len() == 6 && code.is_ascii() {
+        format!("{} {}", &code[..3], &code[3..])
+    } else {
+        code.to_string()
+    }
+}
+
 fn kind_counts(rows: &[Row]) -> Vec<(Kind, usize)> {
     let mut map: std::collections::HashMap<Kind, usize> = Default::default();
     for r in rows {
@@ -199,6 +208,9 @@ struct App {
     selecting: bool,
     ticked_ids: std::collections::HashSet<i64>,
     high_contrast: bool,
+    /// Show live two-factor codes in the list rows. Off by default: a code
+    /// on screen is readable by anyone behind the user.
+    list_codes: bool,
     rows: Vec<Row>,
     open_entry: Option<i64>,
     reveal_password: bool,
@@ -262,6 +274,7 @@ impl Default for App {
             selecting: false,
             ticked_ids: Default::default(),
             high_contrast: false,
+            list_codes: false,
             rows: Vec::new(),
             open_entry: None,
             reveal_password: false,
@@ -719,6 +732,7 @@ impl App {
         self.change_again.clear();
         self.panel = Panel::List;
         self.show_shortcuts = false;
+        self.list_codes = false;
         self.selecting = false;
         self.ticked_ids.clear();
         self.set(reason, Level::None);
@@ -3053,7 +3067,22 @@ impl App {
                         .size(12.5)
                         .color(palette().muted),
                     );
-                    ui.add_space(16.0);
+                    ui.add_space(12.0);
+                    for (n, step) in [
+                        "Add your first entry — pick what it is, and Generate makes a strong password.",
+                        "Bring the rest with Import (CSV or KeePass).",
+                        "Press ? any time for shortcuts. The vault locks itself after 5 minutes idle.",
+                    ]
+                    .iter()
+                    .enumerate()
+                    {
+                        ui.label(
+                            egui::RichText::new(format!("{}.  {step}", n + 1))
+                                .size(12.0)
+                                .color(palette().muted),
+                        );
+                    }
+                    ui.add_space(14.0);
                     ui.horizontal(|ui| {
                         ui.add_space(ui.available_width() / 2.0 - 130.0);
                         if primary(ui, "Add an entry") {
@@ -3126,6 +3155,17 @@ impl App {
                                         }
                                         if row.totp.is_some() && row.kind != Kind::Authenticator {
                                             sub.push_str("  ·  2FA");
+                                        }
+                                        if self.list_codes {
+                                            if let Some(code) = row
+                                                .totp
+                                                .as_deref()
+                                                .and_then(|sec| totp::code_now(sec).ok())
+                                            {
+                                                sub.push_str("  ·  ");
+                                                sub.push_str(&group_code(&code));
+                                                sub.push_str(&format!(" ({}s)", totp::seconds_remaining()));
+                                            }
                                         }
                                         ui.add(
                                             egui::Label::new(
@@ -4471,6 +4511,9 @@ impl App {
                 apply_theme(ui.ctx(), self.light);
             }
 
+            ui.checkbox(&mut self.list_codes, "Show two-factor codes in the list")
+                .on_hover_text("Visible to anyone who can see your screen. Resets when you lock.");
+
             ui.add_space(16.0);
             label(ui, "RECENT ACTIVITY");
             ui.label(
@@ -4655,6 +4698,13 @@ mod tests {
 
     fn names(rows: &[Row]) -> Vec<&str> {
         rows.iter().map(|r| r.name.as_str()).collect()
+    }
+
+    #[test]
+    fn group_code_splits_six_digits_only() {
+        assert_eq!(group_code("123456"), "123 456");
+        assert_eq!(group_code("12345678"), "12345678");
+        assert_eq!(group_code(""), "");
     }
 
     #[test]

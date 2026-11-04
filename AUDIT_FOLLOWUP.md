@@ -36,6 +36,7 @@ checked by unit test) with a Settings toggle.
 
 ## Remaining
 
-- Keyboard input flows were not exercised with a real keyboard; only static screenshots exist (lock screen, editor, statistics, unlocked list in dark, light and high-contrast dark). The 760 px minimum width and mouse flows were not exercised.
-- Not implemented: onboarding wizard, import preview/mapping, TOTP codes in list rows, custom fields UI beyond existing category fields, related entries, skeleton/loading states, reduced-motion switch, screen-reader labels (egui has limited AccessKit support here).
+- Interaction was driven for real under Xvfb with xdotool: typing the path and passphrase and unlocking, Down x2 selecting the second entry, `?` opening the shortcuts overlay, Ctrl+L locking and clearing the passphrase field. Not driven: Select mode, bulk trash, Ctrl+C, the 760 px minimum width, the editor and import flows.
+- Added: a three-step first-run hint in the empty-vault state (not a wizard) and an opt-in Settings switch to show live two-factor codes in list rows (off by default, reset on lock).
+- Not implemented: full onboarding wizard, import preview/mapping, custom-fields editor beyond the existing category fields, related entries, skeleton/loading states, reduced-motion switch, screen-reader labels (limited by the egui version in use).
 - Pre-existing clippy warnings remain in other modules.
