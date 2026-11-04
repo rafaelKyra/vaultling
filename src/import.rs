@@ -156,6 +156,58 @@ pub fn parse(text: &str) -> Result<(Source, Vec<Incoming>), ImportError> {
     parse_counting(text).map(|(source, rows, _)| (source, rows))
 }
 
+/// Read a KeePass (KDBX 4) database from `reader`.
+///
+/// Returns the entries that have a title and a password, and how many entries
+/// were left out for lacking either. The enclosing group's name becomes the
+/// tag, so KeePass folders survive as something searchable. Errors are
+/// deliberately vague about the cause: a wrong password and a damaged file look
+/// the same from outside, and saying which would help an attacker.
+pub fn parse_kdbx<R: std::io::Read>(
+    reader: &mut R,
+    password: &str,
+) -> Result<(Vec<Incoming>, usize), String> {
+    let key = keepass::DatabaseKey::new().with_password(password);
+    let db = keepass::Database::open(reader, key)
+        .map_err(|_| "wrong password, or not a KDBX 4 file".to_string())?;
+    let mut rows = Vec::new();
+    let mut skipped = 0usize;
+    collect_group(db.root(), None, &mut rows, &mut skipped);
+    Ok((rows, skipped))
+}
+
+fn collect_group(
+    group: keepass::db::GroupRef<'_>,
+    path: Option<&str>,
+    rows: &mut Vec<Incoming>,
+    skipped: &mut usize,
+) {
+    for e in group.entries() {
+        match (e.get_title(), e.get_password()) {
+            (Some(title), Some(pw)) if !title.is_empty() && !pw.is_empty() => {
+                let nonempty = |v: Option<&str>| v.filter(|s| !s.is_empty()).map(str::to_string);
+                rows.push(Incoming {
+                    name: title.to_string(),
+                    username: e.get_username().unwrap_or("").to_string(),
+                    password: pw.to_string(),
+                    uri: nonempty(e.get("URL")),
+                    // KeePass keeps TOTP under "otp", as an otpauth URI.
+                    totp: e.get("otp").and_then(crate::totp::normalize_secret),
+                    notes: nonempty(e.get("Notes")),
+                    tags: path.map(str::to_string),
+                });
+            }
+            _ => *skipped += 1,
+        }
+    }
+    // Only sub-folders become tags; the database root is unnamed for our
+    // purposes.
+    for g in group.groups() {
+        let name = g.name.clone();
+        collect_group(g, Some(name.as_str()), rows, skipped);
+    }
+}
+
 /// Drop rows that already exist, or that repeat earlier rows of the same file.
 ///
 /// Two entries are the same when name (ignoring case), username and password
@@ -339,6 +391,30 @@ mod tests {
         assert_eq!(kept.len(), 2);
         assert_eq!(kept[0].password, "pw1");
         assert_eq!(kept[1].password, "pw2");
+    }
+
+    #[test]
+    fn reads_a_synthetic_kdbx() {
+        let bytes = include_bytes!("../tests/fixtures/synthetic.kdbx");
+        let (rows, skipped) = parse_kdbx(&mut &bytes[..], "kdbx-test-pass").unwrap();
+        assert_eq!(skipped, 1, "the entry with no password");
+        assert_eq!(rows.len(), 4);
+        let mail = rows.iter().find(|r| r.name == "KP Mail").unwrap();
+        assert_eq!(mail.username, "alice");
+        assert_eq!(mail.uri.as_deref(), Some("https://mail.example"));
+        assert_eq!(mail.notes.as_deref(), Some("synthetic note"));
+        assert!(mail.tags.is_none());
+        let authy = rows.iter().find(|r| r.name == "KP Authy").unwrap();
+        assert_eq!(authy.totp.as_deref(), Some("JBSWY3DPEHPK3PXP"));
+        let work = rows.iter().find(|r| r.name == "KP Work").unwrap();
+        assert_eq!(work.tags.as_deref(), Some("Work"));
+    }
+
+    #[test]
+    fn a_wrong_kdbx_password_gives_the_vague_error() {
+        let bytes = include_bytes!("../tests/fixtures/synthetic.kdbx");
+        let err = parse_kdbx(&mut &bytes[..], "nope").unwrap_err();
+        assert_eq!(err, "wrong password, or not a KDBX 4 file");
     }
 
     #[test]

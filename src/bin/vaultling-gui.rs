@@ -865,36 +865,48 @@ impl App {
             return self.set("vault is locked", Level::Bad);
         };
 
-        let result = (|| -> Result<(usize, usize), String> {
+        let mut existing: Vec<(String, String, String)> = self
+            .rows
+            .iter()
+            .map(|r| (r.name.clone(), r.username.clone(), r.password.clone()))
+            .collect();
+        let result = (|| -> Result<(usize, usize, usize), String> {
             let mut file = std::fs::File::open(&path).map_err(|_| "cannot open that file")?;
-            let key = keepass::DatabaseKey::new().with_password(&pass);
-            let kdbx = keepass::Database::open(&mut file, key)
-                .map_err(|_| "wrong password, or not a KDBX 4 file")?;
-            let (mut ok, mut skipped) = (0usize, 0usize);
-            for entry in kdbx.iter_all_entries() {
-                match (entry.get_title(), entry.get_password()) {
-                    (Some(title), Some(password)) => {
-                        let user = entry.get_username().unwrap_or("");
-                        let url = entry.get("URL").filter(|u| !u.is_empty());
-                        // KeePass stores TOTP under "otp" as an otpauth URI;
-                        // normalize_secret handles both that and a bare secret.
-                        let otp = entry.get("otp").and_then(totp::normalize_secret);
-                        db.insert_entry(session, title, user, password, url, otp.as_deref())
-                            .map_err(|e| e.to_string())?;
-                        ok += 1;
-                    }
-                    _ => skipped += 1,
-                }
+            let (rows, skipped) = vaultling::import::parse_kdbx(&mut file, &pass)?;
+            let (rows, dupes) = vaultling::import::without_duplicates(
+                existing.iter().map(|(n, u, p)| (n.as_str(), u.as_str(), p.as_str())),
+                rows,
+            );
+            for r in &rows {
+                db.insert_entry_full(
+                    session, &r.name, &r.username, &r.password,
+                    r.uri.as_deref(), r.totp.as_deref(),
+                    r.notes.as_deref(), r.tags.as_deref(),
+                )
+                .map_err(|e| e.to_string())?;
             }
-            Ok((ok, skipped))
+            Ok((rows.len(), skipped, dupes))
         })();
+        {
+            use zeroize::Zeroize;
+            for e in existing.iter_mut() {
+                e.2.zeroize();
+            }
+        }
 
         match result {
-            Ok((ok, skipped)) => {
+            Ok((ok, skipped, dupes)) => {
                 self.import_path.clear();
                 self.reload();
                 self.panel = Panel::List;
-                self.set(format!("Imported {ok} entries, skipped {skipped}"), Level::Ok);
+                let mut note = String::new();
+                if skipped > 0 {
+                    note.push_str(&format!(", {skipped} skipped (no title or password)"));
+                }
+                if dupes > 0 {
+                    note.push_str(&format!(", {dupes} already in the vault"));
+                }
+                self.set(format!("Imported {ok} entries{note}"), Level::Ok);
             }
             Err(why) => self.set(why, Level::Bad),
         }

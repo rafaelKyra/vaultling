@@ -4,6 +4,7 @@
 *.db-wal
 *.db-shm
 *.kdbx
+!tests/fixtures/*.kdbx
 PROMPT.txt
 PROMPT_CONTINUARE.md
 /For inspiration or porting code/
