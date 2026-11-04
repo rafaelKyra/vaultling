@@ -18,6 +18,8 @@ pub struct Incoming {
     pub totp: Option<String>,
     pub notes: Option<String>,
     pub tags: Option<String>,
+    /// Category, when the file says (Vaultling's own export does).
+    pub kind: Option<crate::kind::Kind>,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -27,6 +29,8 @@ pub enum Source {
     Bitwarden,
     LastPass,
     KeePass,
+    /// Vaultling's own export.
+    Vaultling,
     /// Headers we recognised field-by-field without matching a known product.
     Generic,
 }
@@ -39,6 +43,7 @@ impl Source {
             Source::Bitwarden => "Bitwarden",
             Source::LastPass => "LastPass",
             Source::KeePass => "KeePass",
+            Source::Vaultling => "Vaultling",
             Source::Generic => "generic CSV",
         }
     }
@@ -136,7 +141,9 @@ fn find(headers: &[String], names: &[&str]) -> Option<usize> {
 /// Detect the product from its header row.
 pub fn detect(headers: &[String]) -> Source {
     let has = |n: &str| headers.iter().any(|h| h.eq_ignore_ascii_case(n));
-    if has("login_uri") && has("login_password") {
+    if has("kind") && has("name") && has("password") && has("tags") {
+        Source::Vaultling
+    } else if has("login_uri") && has("login_password") {
         Source::Bitwarden
     } else if has("url") && has("username") && has("password") && has("grouping") {
         Source::LastPass
@@ -195,6 +202,7 @@ fn collect_group(
                     totp: e.get("otp").and_then(crate::totp::normalize_secret),
                     notes: nonempty(e.get("Notes")),
                     tags: path.map(str::to_string),
+                    kind: None,
                 });
             }
             _ => *skipped += 1,
@@ -254,6 +262,8 @@ pub fn parse_counting(text: &str) -> Result<(Source, Vec<Incoming>, usize), Impo
     let i_totp = find(&headers, &["totp", "login_totp", "otpauth", "otp"]);
     let i_notes = find(&headers, &["notes", "note", "comment", "extra"]);
     let i_tags = find(&headers, &["grouping", "group", "folder", "category", "tags"]);
+    // Only Vaultling's own export has this column.
+    let i_kind = find(&headers, &["kind"]);
 
     let get = |row: &[String], idx: Option<usize>| -> Option<String> {
         idx.and_then(|i| row.get(i))
@@ -273,7 +283,9 @@ pub fn parse_counting(text: &str) -> Result<(Source, Vec<Incoming>, usize), Impo
         let password = row[i_pass].trim().to_string();
         // Rows with no password are bookmarks, not credentials. Chrome and
         // Firefox both emit them.
-        if password.is_empty() {
+        // Vaultling's own export keeps entries that have no password (secure
+        // notes, recovery codes) because it also says what they are.
+        if password.is_empty() && !(i_kind.is_some() && get(&row, i_name).is_some()) {
             skipped += 1;
             continue;
         }
@@ -289,6 +301,7 @@ pub fn parse_counting(text: &str) -> Result<(Source, Vec<Incoming>, usize), Impo
             totp: get(&row, i_totp).and_then(|t| crate::totp::normalize_secret(&t)),
             notes: get(&row, i_notes),
             tags: get(&row, i_tags),
+            kind: get(&row, i_kind).and_then(|k| crate::kind::Kind::from_label(&k)),
         });
     }
 
@@ -378,6 +391,7 @@ mod tests {
             totp: None,
             notes: None,
             tags: None,
+            kind: None,
         };
         let rows = vec![
             row("Mail", "me", "pw1"),
@@ -415,6 +429,19 @@ mod tests {
         let bytes = include_bytes!("../tests/fixtures/synthetic.kdbx");
         let err = parse_kdbx(&mut &bytes[..], "nope").unwrap_err();
         assert_eq!(err, "wrong password, or not a KDBX 4 file");
+    }
+
+    #[test]
+    fn vaultling_export_round_trips_the_category() {
+        let csv = "name,username,password,url,totp,notes,tags,kind\n\
+                   \"Mail\",\"me\",\"pw\",\"\",\"\",\"\",\"\",\"Email account\"\n\
+                   \"Alarm\",\"\",\"\",\"\",\"\",\"code 1234\",\"\",\"Secure note\"\n";
+        let (_, rows, skipped) = parse_counting(csv).unwrap();
+        assert_eq!(skipped, 0);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].kind, Some(crate::kind::Kind::Email));
+        assert_eq!(rows[1].kind, Some(crate::kind::Kind::SecureNote));
+        assert_eq!(rows[1].notes.as_deref(), Some("code 1234"));
     }
 
     #[test]

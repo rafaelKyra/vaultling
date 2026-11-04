@@ -195,6 +195,12 @@ impl Kind {
         ALL.get(v as usize).copied().unwrap_or(Kind::Website)
     }
 
+    /// The category with this label (case-insensitive), if there is one.
+    pub fn from_label(label: &str) -> Option<Kind> {
+        let l = label.trim();
+        ALL.iter().copied().find(|k| k.label().eq_ignore_ascii_case(l))
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Kind::Website => "Website",

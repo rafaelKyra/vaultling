@@ -878,10 +878,19 @@ impl App {
                 rows,
             );
             for r in &rows {
-                db.insert_entry_full(
-                    session, &r.name, &r.username, &r.password,
-                    r.uri.as_deref(), r.totp.as_deref(),
-                    r.notes.as_deref(), r.tags.as_deref(),
+                db.insert_draft(
+                    session,
+                    &EntryDraft {
+                        name: &r.name,
+                        username: &r.username,
+                        password: &r.password,
+                        uri: r.uri.as_deref(),
+                        totp_secret: r.totp.as_deref(),
+                        notes: r.notes.as_deref(),
+                        tags: r.tags.as_deref(),
+                        kind: r.kind.unwrap_or_default(),
+                        ..EntryDraft::default()
+                    },
                 )
                 .map_err(|e| e.to_string())?;
             }
@@ -4045,10 +4054,19 @@ impl App {
                 rows,
             );
             for r in &rows {
-                db.insert_entry_full(
-                    session, &r.name, &r.username, &r.password,
-                    r.uri.as_deref(), r.totp.as_deref(),
-                    r.notes.as_deref(), r.tags.as_deref(),
+                db.insert_draft(
+                    session,
+                    &EntryDraft {
+                        name: &r.name,
+                        username: &r.username,
+                        password: &r.password,
+                        uri: r.uri.as_deref(),
+                        totp_secret: r.totp.as_deref(),
+                        notes: r.notes.as_deref(),
+                        tags: r.tags.as_deref(),
+                        kind: r.kind.unwrap_or_default(),
+                        ..EntryDraft::default()
+                    },
                 )
                 .map_err(|e| e.to_string())?;
             }
@@ -4162,6 +4180,7 @@ impl App {
                 totp: r.totp.clone(),
                 notes: r.notes.clone(),
                 tags: r.tags.clone(),
+                kind: r.kind,
             })
             .collect();
         let n = rows.len();
