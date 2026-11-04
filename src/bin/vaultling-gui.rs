@@ -1088,15 +1088,16 @@ fn form<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.add_space(pad);
-                ui.vertical(|ui| {
-                    ui.set_max_width(width);
-                    card(ui, add)
-                })
+            // An explicit rectangle rather than a horizontal layout: a
+            // horizontal sizes itself to its contents' height, which hands any
+            // scroll area inside the card (trash, history) almost no height.
+            let avail = ui.available_rect_before_wrap();
+            let rect = egui::Rect::from_min_size(
+                avail.min + egui::vec2(pad, 0.0),
+                egui::vec2(width, avail.height()),
+            );
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| card(ui, add))
                 .inner
-            })
-            .inner
         })
         .inner
 }
