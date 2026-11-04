@@ -96,6 +96,18 @@ const HC_LIGHT: Palette = Palette {
 thread_local! {
     static PALETTE: std::cell::Cell<Palette> = const { std::cell::Cell::new(DARK) };
     static HIGH_CONTRAST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static REDUCED_MOTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Turn decorative motion (the falling-character animation, timed repaints)
+/// off or on.
+pub fn set_reduced_motion(on: bool) {
+    REDUCED_MOTION.with(|c| c.set(on));
+}
+
+/// Whether decorative motion should be suppressed.
+pub fn reduced_motion() -> bool {
+    REDUCED_MOTION.with(|c| c.get())
 }
 
 /// Switch the high-contrast variant on or off. Takes effect at the next
@@ -465,6 +477,14 @@ mod tests {
             assert!(ratio(p.on_accent, p.accent) >= 4.5, "{name} on_accent");
             assert!(ratio(p.line, p.bg) >= 3.0, "{name} line");
         }
+    }
+
+    #[test]
+    fn reduced_motion_flag_round_trips() {
+        assert!(!reduced_motion());
+        set_reduced_motion(true);
+        assert!(reduced_motion());
+        set_reduced_motion(false);
     }
 
     #[test]

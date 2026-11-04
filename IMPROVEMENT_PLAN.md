@@ -74,7 +74,9 @@ Legend: done / partial / missing. Evidence is in `src/bin/vaultling-gui.rs` unle
 | TOTP in detail with countdown | done | detail pane; optional in list rows (Settings, off by default) |
 | Password history | done | `history_rows` |
 | Stats dashboard, high contrast | done | `stats_view`, `HC_*` palettes |
-| Onboarding wizard | partial | three-step hint in the empty-vault state; no wizard |
+| Onboarding wizard | done | three-step walkthrough shown once per unlock of an empty vault (`WELCOME`) |
+| Reduced motion | done | Settings switch; stops the character animation and timed redraws |
+| Screen-reader labels | partial | names for icon buttons, navigation rows, list rows and the category picker via AccessKit (tested); full screen-reader session not tried |
 
 Implementation order: finish visual foundation and navigation (rows marked
 partial in the first half of the table) before any new feature.

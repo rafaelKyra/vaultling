@@ -35,16 +35,25 @@ create clear passphrase buffers on use; the KDF and crypto were not touched.
 
 ## Implemented from the plan in this branch
 
-Responsive pane widths (`pane_widths`, window minimum raised to 760x600), list
-sort by name/newest/edited/category, keyboard navigation (arrows, j/k) and a
-`?` shortcuts overlay, multi-select with bulk favourite and move-to-trash
-(recoverable), vault statistics panel, high-contrast palettes (WCAG AAA
-checked by unit test) with a Settings toggle.
+Responsive pane widths, four sort orders, keyboard navigation and a `?`
+overlay, multi-select with bulk favourite and trash, statistics panel,
+high-contrast palettes (WCAG AAA checked), opt-in two-factor codes in the list,
+a three-step first-run walkthrough, a reduce-motion setting, accessible names
+for the custom-drawn controls (checked against the AccessKit tree in unit
+tests), KeePass import with notes, folders as tags and duplicate detection,
+and CSV import/export that keeps the category.
+
+## Verification
+
+- `cargo check --locked --all-targets`: OK (one pre-existing `unused_mut` warning in `examples/seed_demo.rs`).
+- `cargo test --locked --all-targets`: 132 lib tests + 8 gui tests pass, 0 failed.
+- `cargo clippy --locked --all-targets`: warnings remain, all pre-existing and outside the changed code, except none new from this branch (checked by listing the files and lines clippy reports).
+- Real interaction under Xvfb (xdotool, synthetic vaults): unlock, arrow navigation, `?` overlay, Ctrl+L, Ctrl+C and the 20 s clipboard overwrite, typing guard in the search box, Select mode with bulk favourite/trash, trash list and Restore, editor with Generate and Add, 760x600 window, CSV export (mode 0600) and import with duplicates, KeePass import (wrong password and correct password), first-run walkthrough steps 1 to 3.
+- Not exercised: a real screen reader (only the AccessKit tree in unit tests), release-build timing, Wayland, the walkthrough's "Add an entry" button, CSV round trip into an empty vault through the GUI.
 
 ## Remaining
 
-- Interaction was driven for real under Xvfb with xdotool (synthetic vault): unlock by typing, arrow navigation, `?` overlay, Ctrl+L lock, Ctrl+C copy and 20 s clipboard overwrite, typing `a/b?c` in the search box without triggering shortcuts, Select mode with bulk move to trash (36 to 34), editor with Generate and Add (36 to 37). The 760x600 window was driven too. Also driven: bulk favourite ("2 entries marked favourite", sidebar Favourites 2), bulk trash, trash list and Restore. CSV export (file mode 0600, 36 rows) and CSV import were driven too.
-- Added: a three-step first-run hint in the empty-vault state (not a wizard) and an opt-in Settings switch to show live two-factor codes in list rows (off by default, reset on lock).
-- Open: CSV carries the category but not category-specific fields; use the encrypted backup for those. The KDBX import reads the whole file on the UI thread; in a debug build the Argon2 step froze the window for several seconds (release build not measured).
-- Not implemented: full onboarding wizard, import preview/mapping, custom-fields editor beyond the existing category fields, related entries, skeleton/loading states, reduced-motion switch, screen-reader labels (limited by the egui version in use).
+- CSV carries the category but not category-specific fields (card number, host...); the encrypted backup is the lossless copy.
+- KDBX import reads and decrypts on the UI thread; in a debug build the Argon2 step froze the window for several seconds. Release timing not measured.
+- Not implemented: import preview/column mapping, custom-fields editor beyond the existing category fields, related entries, skeleton/loading states.
 - Pre-existing clippy warnings remain in other modules.

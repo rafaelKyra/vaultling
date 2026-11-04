@@ -13,7 +13,9 @@ use eframe::egui;
 use rand_core::{OsRng, RngCore};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use vaultling::gui::design_system::{palette, set_high_contrast, set_palette};
+use vaultling::gui::design_system::{
+    palette, reduced_motion, set_high_contrast, set_palette, set_reduced_motion,
+};
 use vaultling::gui::layout::show_three_pane;
 use vaultling::key_lifecycle::{KeySession, MasterKey};
 use vaultling::kind::{self, Kind};
@@ -112,6 +114,30 @@ fn group_code(code: &str) -> String {
     }
 }
 
+/// The first-run walkthrough, one entry per step: title and body.
+const WELCOME: [(&str, &str); 3] = [
+    (
+        "Your vault is ready",
+        "Everything is stored encrypted on this machine and nowhere else. \
+         Sixteen categories keep logins, keys, cards, notes and recovery codes apart.",
+    ),
+    (
+        "Add your first entry",
+        "Pick what it is, give it a name and let Generate make a strong password. \
+         Already have a list? Import (CSV or KeePass) brings it in.",
+    ),
+    (
+        "How it protects you",
+        "Copied secrets are overwritten after 20 seconds. The vault locks after \
+         5 minutes idle, when minimised, or with Ctrl+L. Press ? any time for shortcuts.",
+    ),
+];
+
+/// The step after `step`, or `None` once the last one is done.
+fn welcome_next(step: usize) -> Option<usize> {
+    (step + 1 < WELCOME.len()).then_some(step + 1)
+}
+
 fn kind_counts(rows: &[Row]) -> Vec<(Kind, usize)> {
     let mut map: std::collections::HashMap<Kind, usize> = Default::default();
     for r in rows {
@@ -208,6 +234,11 @@ struct App {
     selecting: bool,
     ticked_ids: std::collections::HashSet<i64>,
     high_contrast: bool,
+    reduce_motion: bool,
+    /// First-run walkthrough: the step being shown, if any, and whether it has
+    /// already been offered this session.
+    welcome_step: Option<usize>,
+    welcome_seen: bool,
     /// Show live two-factor codes in the list rows. Off by default: a code
     /// on screen is readable by anyone behind the user.
     list_codes: bool,
@@ -274,6 +305,9 @@ impl Default for App {
             selecting: false,
             ticked_ids: Default::default(),
             high_contrast: false,
+            reduce_motion: false,
+            welcome_step: None,
+            welcome_seen: false,
             list_codes: false,
             rows: Vec::new(),
             open_entry: None,
@@ -732,6 +766,8 @@ impl App {
         self.change_again.clear();
         self.panel = Panel::List;
         self.show_shortcuts = false;
+        self.welcome_step = None;
+        self.welcome_seen = false;
         self.list_codes = false;
         self.selecting = false;
         self.ticked_ids.clear();
@@ -1264,6 +1300,10 @@ fn logo(ui: &mut egui::Ui, size: f32) {
 /// Everything here is arithmetic on positions and opacity — no assets, no
 /// decoding, nothing read from disk.
 fn cipher_rain(ui: &mut egui::Ui, rect: egui::Rect, t: f64, intensity: f32) {
+    // Decoration only: skipped entirely when the user asked for less motion.
+    if reduced_motion() {
+        return;
+    }
     const COLS: usize = 7;
     const GLYPHS: &[u8] = b"0123456789ABCDEF";
     let p = ui.painter().with_clip_rect(rect);
@@ -1739,6 +1779,8 @@ fn icon_button(ui: &mut egui::Ui, glyph: Icon, text: &str) -> bool {
 
     let rect = inner.rect.expand2(egui::vec2(0.0, 5.0));
     let click = ui.interact(rect, id, egui::Sense::click());
+    // Screen readers get the label; the glyph is decoration.
+    click.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, text));
     let fill = if click.hovered() {
         palette().accent.linear_multiply(0.45)
     } else {
@@ -1819,6 +1861,13 @@ fn nav_row(
     const H: f32 = 27.0;
     let w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, H), egui::Sense::click());
+    resp.widget_info(|| {
+        let label = match count {
+            Some(n) => format!("{text}, {n}"),
+            None => text.to_string(),
+        };
+        egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, label)
+    });
     let p = ui.painter();
 
     if selected {
@@ -1937,6 +1986,8 @@ impl eframe::App for App {
         // needs sixty frames a second, and a vault should not spin a laptop fan
         // while it sits waiting for a passphrase.
         ctx.request_repaint_after(Duration::from_millis(if self.db.is_some() {
+            500
+        } else if reduced_motion() {
             500
         } else {
             50
@@ -2186,6 +2237,62 @@ impl eframe::App for App {
         // others into it would put an empty sidebar next to a password prompt.
         let browsing = self.db.is_some() && self.panel == Panel::List;
 
+        // Offered once per unlock, and only when there is nothing in the vault
+        // yet: a walkthrough over a vault of forty entries is just in the way.
+        if self.db.is_some() && !self.welcome_seen {
+            self.welcome_seen = true;
+            if self.rows.is_empty() {
+                self.welcome_step = Some(0);
+            }
+        }
+        if let (Some(step), true) = (self.welcome_step, self.db.is_some()) {
+            let (title, body) = WELCOME[step.min(WELCOME.len() - 1)];
+            let mut done = false;
+            let mut go_add = false;
+            let mut next = None;
+            egui::Window::new(format!("Welcome — step {} of {}", step + 1, WELCOME.len()))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .default_width(380.0)
+                .show(ctx, |ui| {
+                    ui.label(egui::RichText::new(title).size(17.0).strong());
+                    ui.add_space(6.0);
+                    ui.add(egui::Label::new(egui::RichText::new(body).color(palette().muted)).wrap());
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if step > 0 && ui.button("Back").clicked() {
+                            next = Some(step - 1);
+                        }
+                        match welcome_next(step) {
+                            Some(n) => {
+                                if primary(ui, "Next") {
+                                    next = Some(n);
+                                }
+                            }
+                            None => {
+                                if primary(ui, "Add an entry") {
+                                    go_add = true;
+                                }
+                            }
+                        }
+                        if ui.button("Skip").clicked() {
+                            done = true;
+                        }
+                    });
+                });
+            if go_add {
+                self.draft = Draft::default();
+                self.panel = Panel::Editor;
+                self.open_entry = None;
+                self.welcome_step = None;
+            } else if done {
+                self.welcome_step = None;
+            } else if let Some(n) = next {
+                self.welcome_step = Some(n);
+            }
+        }
+
         if self.show_shortcuts && self.db.is_some() {
             let mut open = true;
             egui::Window::new("Keyboard shortcuts")
@@ -2263,7 +2370,9 @@ impl eframe::App for App {
                             let t = ui.input(|i| i.time);
                             let rect = ui.available_rect_before_wrap();
                             cipher_rain(ui, rect, t, 0.16);
-                            ui.ctx().request_repaint_after(Duration::from_millis(60));
+                            if !reduced_motion() {
+                                ui.ctx().request_repaint_after(Duration::from_millis(60));
+                            }
                             ui.add_space(ui.available_height() * 0.30);
                             ui.vertical_centered(|ui| {
                                 logo(ui, 46.0);
@@ -3213,6 +3322,18 @@ impl App {
                         })
                         .response
                         .interact(egui::Sense::click());
+                    resp.widget_info(|| {
+                        let mut label = format!("{}, {}", row.name, row.kind.label());
+                        if self.selecting {
+                            label.push_str(if ticked { ", ticked" } else { ", not ticked" });
+                        }
+                        egui::WidgetInfo::selected(
+                            egui::WidgetType::SelectableLabel,
+                            true,
+                            selected,
+                            label,
+                        )
+                    });
 
                     if resp.hovered() {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -3535,6 +3656,14 @@ impl App {
                         egui::vec2(CELL, 34.0),
                         egui::Sense::click(),
                     );
+                    resp.widget_info(|| {
+                        egui::WidgetInfo::selected(
+                            egui::WidgetType::RadioButton,
+                            true,
+                            on,
+                            k.label(),
+                        )
+                    });
                     let hot = resp.hovered();
                     let fill = if on {
                         tint.linear_multiply(0.30)
@@ -4579,6 +4708,16 @@ impl App {
                 apply_theme(ui.ctx(), self.light);
             }
 
+            if ui
+                .checkbox(&mut self.reduce_motion, "Reduce motion")
+                .on_hover_text("Stops the falling-character animation and slows redraws")
+                .changed()
+            {
+                set_reduced_motion(self.reduce_motion);
+                ui.ctx().style_mut(|st| {
+                    st.animation_time = if self.reduce_motion { 0.0 } else { 1.0 / 12.0 };
+                });
+            }
             ui.checkbox(&mut self.list_codes, "Show two-factor codes in the list")
                 .on_hover_text("Visible to anyone who can see your screen. Resets when you lock.");
 
@@ -4766,6 +4905,58 @@ mod tests {
 
     fn names(rows: &[Row]) -> Vec<&str> {
         rows.iter().map(|r| r.name.as_str()).collect()
+    }
+
+    /// Names AccessKit exposes for the nodes of one frame.
+    fn accessible_labels(run: impl FnOnce(&mut egui::Ui)) -> Vec<String> {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0))),
+            ..Default::default()
+        };
+        let mut run = Some(run);
+        let out = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                if let Some(f) = run.take() {
+                    f(ui);
+                }
+            });
+        });
+        let update = out.platform_output.accesskit_update.expect("accesskit enabled");
+        update
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| node.name().map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn icon_buttons_have_an_accessible_name() {
+        let labels = accessible_labels(|ui| {
+            icon_button(ui, Icon::Plus, "Add");
+        });
+        assert!(labels.iter().any(|l| l == "Add"), "{labels:?}");
+    }
+
+    #[test]
+    fn category_rows_are_named_with_their_count() {
+        let labels = accessible_labels(|ui| {
+            nav_row(ui, None, "Website", Some(4), false, palette().accent, 0.0, false);
+        });
+        assert!(labels.iter().any(|l| l == "Website, 4"), "{labels:?}");
+    }
+
+    #[test]
+    fn the_walkthrough_has_a_finite_number_of_steps() {
+        let mut step = 0;
+        let mut seen = 1;
+        while let Some(n) = welcome_next(step) {
+            step = n;
+            seen += 1;
+        }
+        assert_eq!(seen, WELCOME.len());
+        assert!(WELCOME.iter().all(|(t, b)| !t.is_empty() && !b.is_empty()));
     }
 
     #[test]
