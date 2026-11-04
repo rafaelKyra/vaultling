@@ -13,7 +13,7 @@ use eframe::egui;
 use rand_core::{OsRng, RngCore};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use vaultling::gui::design_system::{palette, set_palette};
+use vaultling::gui::design_system::{palette, set_high_contrast, set_palette};
 use vaultling::gui::layout::show_three_pane;
 use vaultling::key_lifecycle::{KeySession, MasterKey};
 use vaultling::kind::{self, Kind};
@@ -49,6 +49,7 @@ enum Panel {
     Export,
     History(i64),
     Trash,
+    Stats,
     Confirm(i64, String),
     ConfirmPurge(i64, String),
     ChangePass,
@@ -59,7 +60,57 @@ enum Panel {
 #[derive(PartialEq, Clone, Copy)]
 enum Sort {
     Name,
+    /// Most recently added first.
     Recent,
+    /// Most recently edited first.
+    Updated,
+    /// Grouped by category, then by name.
+    Category,
+}
+
+impl Sort {
+    fn label(self) -> &'static str {
+        match self {
+            Sort::Name => "A\u{2013}Z",
+            Sort::Recent => "Newest",
+            Sort::Updated => "Edited",
+            Sort::Category => "Category",
+        }
+    }
+    fn next(self) -> Sort {
+        match self {
+            Sort::Name => Sort::Recent,
+            Sort::Recent => Sort::Updated,
+            Sort::Updated => Sort::Category,
+            Sort::Category => Sort::Name,
+        }
+    }
+}
+
+fn sort_rows(rows: &mut [Row], sort: Sort) {
+    match sort {
+        Sort::Name => rows.sort_by_key(|r| r.name.to_lowercase()),
+        Sort::Recent => rows.sort_by_key(|r| std::cmp::Reverse(r.id)),
+        Sort::Updated => rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(b.id.cmp(&a.id))),
+        Sort::Category => rows.sort_by_key(|r| (r.kind.label().to_string(), r.name.to_lowercase())),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Bulk {
+    Trash,
+    Favorite(bool),
+}
+
+/// How many entries each category holds, largest first, empty ones omitted.
+fn kind_counts(rows: &[Row]) -> Vec<(Kind, usize)> {
+    let mut map: std::collections::HashMap<Kind, usize> = Default::default();
+    for r in rows {
+        *map.entry(r.kind).or_insert(0) += 1;
+    }
+    let mut v: Vec<_> = map.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.label().cmp(b.0.label())));
+    v
 }
 
 /// One entry as the list needs it: the id for editing, plus decrypted fields.
@@ -143,6 +194,11 @@ struct App {
     filter: String,
     tag_filter: Option<String>,
     sort: Sort,
+    show_shortcuts: bool,
+    /// Multi-select mode for bulk actions, and the ids ticked in it.
+    selecting: bool,
+    ticked_ids: std::collections::HashSet<i64>,
+    high_contrast: bool,
     rows: Vec<Row>,
     open_entry: Option<i64>,
     reveal_password: bool,
@@ -202,6 +258,10 @@ impl Default for App {
             filter: String::new(),
             tag_filter: None,
             sort: Sort::Name,
+            show_shortcuts: false,
+            selecting: false,
+            ticked_ids: Default::default(),
+            high_contrast: false,
             rows: Vec::new(),
             open_entry: None,
             reveal_password: false,
@@ -658,6 +718,9 @@ impl App {
         self.change_new.clear();
         self.change_again.clear();
         self.panel = Panel::List;
+        self.show_shortcuts = false;
+        self.selecting = false;
+        self.ticked_ids.clear();
         self.set(reason, Level::None);
     }
 
@@ -745,6 +808,36 @@ impl App {
             }
             Err(why) => self.set(why, Level::Bad),
         }
+    }
+
+    /// Move every ticked entry to the trash (recoverable) or set/clear its
+    /// favourite flag.
+    fn bulk(&mut self, action: Bulk) {
+        let ids: Vec<i64> = self.ticked_ids.iter().copied().collect();
+        let Some(db) = self.db.as_ref() else {
+            return self.set("vault is locked", Level::Bad);
+        };
+        let mut done = 0usize;
+        for id in &ids {
+            let ok = match action {
+                Bulk::Trash => db.trash_entry(*id),
+                Bulk::Favorite(f) => db.set_favorite(*id, f),
+            };
+            if matches!(ok, Ok(true)) {
+                done += 1;
+            }
+        }
+        self.ticked_ids.clear();
+        if matches!(action, Bulk::Trash) {
+            self.open_entry = None;
+        }
+        self.reload();
+        let msg = match action {
+            Bulk::Trash => format!("{done} entries moved to trash"),
+            Bulk::Favorite(true) => format!("{done} entries marked favourite"),
+            Bulk::Favorite(false) => format!("{done} entries unmarked"),
+        };
+        self.set(msg, if done == ids.len() { Level::Ok } else { Level::Bad });
     }
 
     fn import_kdbx(&mut self) {
@@ -1867,6 +1960,11 @@ impl eframe::App for App {
                     // chosen per theme is exactly the kind of thing that goes
                     // wrong in only one of them, and stays wrong because only
                     // the other one is ever looked at.
+                    if std::env::var("VAULTLING_SHOT_HC").is_ok() {
+                        self.high_contrast = true;
+                        set_high_contrast(true);
+                        apply_theme(ctx, std::env::var("VAULTLING_SHOT_LIGHT").is_ok());
+                    }
                     if std::env::var("VAULTLING_SHOT_LIGHT").is_ok() {
                         self.light = true;
                         apply_theme(ctx, true);
@@ -1882,6 +1980,7 @@ impl eframe::App for App {
                             "settings" => Panel::Settings,
                             "help" => Panel::Help,
                             "trash" => Panel::Trash,
+                            "stats" => Panel::Stats,
                             _ => Panel::List,
                         };
                         // VAULTLING_SHOT_KIND=<number> picks a category: which
@@ -1967,18 +2066,55 @@ impl eframe::App for App {
         // Keyboard first: a password manager is used dozens of times a day, and
         // reaching for the mouse each time is what makes people stop using one.
         if self.db.is_some() {
-            let (lock, copy, close, find) = ctx.input(|i| {
+            // Plain-key shortcuts must never fire while the user is typing: a
+            // `/` in a URL field would otherwise jump to search, and Ctrl+C in
+            // a text box would overwrite the selection they meant to copy with
+            // the entry's password.
+            let typing = ctx.wants_keyboard_input();
+            let (lock, copy, close, find, help, down, up) = ctx.input(|i| {
+                let plain = !typing && !i.modifiers.any();
                 (
                     i.key_pressed(egui::Key::L) && i.modifiers.ctrl,
-                    i.key_pressed(egui::Key::C) && i.modifiers.ctrl,
+                    i.key_pressed(egui::Key::C) && i.modifiers.ctrl && !typing,
                     i.key_pressed(egui::Key::Escape),
-                    i.key_pressed(egui::Key::Slash) && !i.modifiers.ctrl,
+                    i.key_pressed(egui::Key::Slash) && plain,
+                    // `?` arrives as a text event, not a key press, on most layouts.
+                    !typing
+                        && i.events
+                            .iter()
+                            .any(|e| matches!(e, egui::Event::Text(t) if t == "?")),
+                    (i.key_pressed(egui::Key::ArrowDown) || i.key_pressed(egui::Key::J)) && plain,
+                    (i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::K)) && plain,
                 )
             });
+            if help {
+                self.show_shortcuts = !self.show_shortcuts;
+            }
+            if (down || up) && self.panel == Panel::List && !self.selecting {
+                let mut order = self.matching_rows();
+                sort_rows(&mut order, self.sort);
+                if !order.is_empty() {
+                    let at = self.open_entry.and_then(|id| order.iter().position(|r| r.id == id));
+                    let to = match (at, down) {
+                        (None, _) => 0,
+                        (Some(i), true) => (i + 1).min(order.len() - 1),
+                        (Some(i), false) => i.saturating_sub(1),
+                    };
+                    self.open_entry = Some(order[to].id);
+                    self.reveal_password = false;
+                    self.reveal_notes = false;
+                    self.revealed_fields.clear();
+                }
+            }
             if lock {
                 self.lock("Locked");
             } else if close {
-                if self.panel != Panel::List {
+                if self.show_shortcuts {
+                    self.show_shortcuts = false;
+                } else if self.selecting {
+                    self.selecting = false;
+                    self.ticked_ids.clear();
+                } else if self.panel != Panel::List {
                     self.panel = Panel::List;
                 } else if self.open_entry.is_some() {
                     self.open_entry = None;
@@ -2001,6 +2137,34 @@ impl eframe::App for App {
         // different shapes. Only the last one earns three panes; forcing the
         // others into it would put an empty sidebar next to a password prompt.
         let browsing = self.db.is_some() && self.panel == Panel::List;
+
+        if self.show_shortcuts && self.db.is_some() {
+            let mut open = true;
+            egui::Window::new("Keyboard shortcuts")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    egui::Grid::new("shortcuts").num_columns(2).spacing([24.0, 6.0]).show(ui, |ui| {
+                        for (k, what) in [
+                            ("/", "Search"),
+                            ("\u{2193} / j,  \u{2191} / k", "Next / previous entry"),
+                            ("Ctrl+C", "Copy the open entry's secret"),
+                            ("Ctrl+L", "Lock now"),
+                            ("Esc", "Close help, selection or panel"),
+                            ("?", "Show or hide this list"),
+                        ] {
+                            ui.label(egui::RichText::new(k).monospace().color(palette().accent));
+                            ui.label(what);
+                            ui.end_row();
+                        }
+                    });
+                });
+            if !open {
+                self.show_shortcuts = false;
+            }
+        }
 
         // No title bar on the lock screen: the hero below already carries the
         // mark and the name, and showing both put the same two lines twice
@@ -2072,6 +2236,26 @@ impl eframe::App for App {
                     }
                 },
             );
+        } else {
+            // Everything that is not the browsing list: the lock screen, vault
+            // creation, the editor and every other form. One full-width pane.
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::none()
+                        .fill(palette().bg)
+                        .inner_margin(egui::Margin::symmetric(16.0, 14.0)),
+                )
+                .show(ctx, |ui| {
+                    if self.db.is_some() {
+                        self.unlocked(ui);
+                    } else if self.show_help_locked {
+                        self.help_view(ui);
+                    } else if self.creating {
+                        self.create_view(ui);
+                    } else {
+                        self.locked(ui);
+                    }
+                });
         }
     }
 }
@@ -2727,6 +2911,7 @@ impl App {
             Panel::Export => return self.export_view(ui),
             Panel::History(id) => return self.history_view(ui, id),
             Panel::Trash => return self.trash_view(ui),
+            Panel::Stats => return self.stats_view(ui),
             Panel::Settings => return self.settings_view(ui),
             Panel::Help => return self.help_view(ui),
             Panel::List => {}
@@ -2756,6 +2941,10 @@ impl App {
                 }
             });
             ui.menu_button("More  v", |ui| {
+                if ui.button("Vault statistics…").clicked() {
+                    self.panel = Panel::Stats;
+                    ui.close_menu();
+                }
                 if ui.button("Export & backup…").clicked() {
                     self.panel = Panel::Export;
                     ui.close_menu();
@@ -2787,24 +2976,61 @@ impl App {
             // scope inside a wrapped row claims all the width still going,
             // leaving the button before it whatever is left — which is how
             // "More" spent two sessions being drawn as "Mor".
-            let t = match self.sort {
-                Sort::Name => "A–Z",
-                Sort::Recent => "Newest",
-            };
-            if ui.button(t).clicked() {
-                self.sort = match self.sort {
-                    Sort::Name => Sort::Recent,
-                    Sort::Recent => Sort::Name,
-                };
+            if ui
+                .button(self.sort.label())
+                .on_hover_text("Change the order of the list")
+                .clicked()
+            {
+                self.sort = self.sort.next();
+            }
+            if ui
+                .selectable_label(self.selecting, "Select")
+                .on_hover_text("Tick several entries to act on them together")
+                .clicked()
+            {
+                self.selecting = !self.selecting;
+                self.ticked_ids.clear();
             }
         });
+        if self.selecting {
+            let visible: Vec<i64> = self.matching_rows().iter().map(|r| r.id).collect();
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("{} selected", self.ticked_ids.len()))
+                        .color(palette().muted),
+                );
+                if ui.small_button("All shown").clicked() {
+                    self.ticked_ids.extend(visible.iter().copied());
+                }
+                if ui.small_button("None").clicked() {
+                    self.ticked_ids.clear();
+                }
+                let any = !self.ticked_ids.is_empty();
+                if ui.add_enabled(any, egui::Button::new("\u{2605} Favourite").small()).clicked() {
+                    self.bulk(Bulk::Favorite(true));
+                }
+                if ui.add_enabled(any, egui::Button::new("\u{2606} Unfavourite").small()).clicked() {
+                    self.bulk(Bulk::Favorite(false));
+                }
+                if ui
+                    .add_enabled(
+                        any,
+                        egui::Button::new(
+                            egui::RichText::new("Move to trash").color(palette().danger),
+                        )
+                        .small(),
+                    )
+                    .on_hover_text("Recoverable from the trash")
+                    .clicked()
+                {
+                    self.bulk(Bulk::Trash);
+                }
+            });
+        }
         ui.add_space(10.0);
 
         let mut shown = self.matching_rows();
-        match self.sort {
-            Sort::Name => shown.sort_by_key(|r| r.name.to_lowercase()),
-            Sort::Recent => shown.sort_by(|a, b| b.id.cmp(&a.id)),
-        }
+        sort_rows(&mut shown, self.sort);
 
         let total = self.rows.len();
         card(ui, |ui| {
@@ -2849,7 +3075,8 @@ impl App {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let last = shown.len().saturating_sub(1);
                 for (i, row) in shown.iter().enumerate() {
-                    let selected = self.open_entry == Some(row.id);
+                    let ticked = self.selecting && self.ticked_ids.contains(&row.id);
+                    let selected = if self.selecting { ticked } else { self.open_entry == Some(row.id) };
                     // The whole row is the target. A dedicated Open button asks
                     // the user to aim at 60 pixels when 700 were available.
                     // A Frame, not a hand-painted rectangle. The first attempt
@@ -2867,15 +3094,23 @@ impl App {
                         .rounding(egui::Rounding::same(9.0))
                         .inner_margin(egui::Margin::symmetric(8.0, 6.0))
                         .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
                             ui.horizontal(|ui| {
+                                if self.selecting {
+                                    let mark = if ticked { "\u{2611}" } else { "\u{2610}" };
+                                    ui.label(egui::RichText::new(mark).size(16.0).color(palette().accent));
+                                }
                                 avatar(ui, &row.name, 30.0);
                                 ui.add_space(4.0);
                                 ui.vertical(|ui| {
-                                    ui.label(
-                                        egui::RichText::new(&row.name)
-                                            .size(14.0)
-                                            .strong()
-                                            .color(if selected { palette().accent } else { palette().text }),
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&row.name)
+                                                .size(14.0)
+                                                .strong()
+                                                .color(if selected { palette().accent } else { palette().text }),
+                                        )
+                                        .truncate(),
                                     );
                                     // The category on the second line, as a
                                     // shape and a word. Without it a mixed
@@ -2892,8 +3127,11 @@ impl App {
                                         if row.totp.is_some() && row.kind != Kind::Authenticator {
                                             sub.push_str("  ·  2FA");
                                         }
-                                        ui.label(
-                                            egui::RichText::new(sub).size(11.0).color(palette().muted),
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(sub).size(11.0).color(palette().muted),
+                                            )
+                                            .truncate(),
                                         );
                                     });
                                 });
@@ -2905,7 +3143,11 @@ impl App {
                     if resp.hovered() {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
-                    if resp.clicked() {
+                    if resp.clicked() && self.selecting {
+                        if !self.ticked_ids.remove(&row.id) {
+                            self.ticked_ids.insert(row.id);
+                        }
+                    } else if resp.clicked() {
                         self.open_entry = Some(row.id);
                         self.reveal_password = false;
                         self.reveal_notes = false;
@@ -4118,6 +4360,56 @@ impl App {
         });
     }
 
+    fn stats_view(&mut self, ui: &mut egui::Ui) {
+        let report = self.security_report();
+        let total = self.rows.len();
+        let with_2fa = self.rows.iter().filter(|r| r.totp.is_some()).count();
+        let favs = self.rows.iter().filter(|r| r.favorite).count();
+        let counts = kind_counts(&self.rows);
+        form(ui, |ui| egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.label(egui::RichText::new("Vault statistics").size(17.0).strong());
+            ui.add_space(10.0);
+            egui::Grid::new("stats").num_columns(2).spacing([24.0, 6.0]).show(ui, |ui| {
+                for (k, v) in [
+                    ("Entries", total.to_string()),
+                    ("Health score", format!("{} / 100", report.score)),
+                    ("Weak passwords", report.weak.to_string()),
+                    ("Reused passwords", report.reused.to_string()),
+                    ("Not changed in a year", report.stale.to_string()),
+                    ("Expired", report.expired.to_string()),
+                    ("With two-factor", with_2fa.to_string()),
+                    ("Favourites", favs.to_string()),
+                ] {
+                    ui.label(egui::RichText::new(k).color(palette().muted));
+                    ui.label(egui::RichText::new(v).strong());
+                    ui.end_row();
+                }
+            });
+            ui.add_space(14.0);
+            label(ui, "BY CATEGORY");
+            let max = counts.iter().map(|(_, n)| *n).max().unwrap_or(1).max(1);
+            for (kind, n) in &counts {
+                ui.horizontal(|ui| {
+                    icon(ui, kind_icon(*kind), 12.0, kind_color(*kind));
+                    ui.add_sized([130.0, 16.0], egui::Label::new(kind.label()).truncate());
+                    ui.add(
+                        egui::ProgressBar::new(*n as f32 / max as f32)
+                            .desired_width(140.0)
+                            .fill(kind_color(*kind)),
+                    );
+                    ui.label(n.to_string());
+                });
+            }
+            if counts.is_empty() {
+                ui.label(egui::RichText::new("Nothing here yet.").color(palette().muted));
+            }
+            ui.add_space(14.0);
+            if ui.button("Back").clicked() {
+                self.panel = Panel::List;
+            }
+        }));
+    }
+
     fn settings_view(&mut self, ui: &mut egui::Ui) {
         form(ui, |ui| {
             ui.label(egui::RichText::new("Settings").size(17.0).strong());
@@ -4167,6 +4459,15 @@ impl App {
                 .checkbox(&mut self.light, "Light theme")
                 .changed()
             {
+                apply_theme(ui.ctx(), self.light);
+            }
+
+            if ui
+                .checkbox(&mut self.high_contrast, "High contrast")
+                .on_hover_text("Stronger text and borders, for low vision or bright rooms")
+                .changed()
+            {
+                set_high_contrast(self.high_contrast);
                 apply_theme(ui.ctx(), self.light);
             }
 
@@ -4316,7 +4617,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([980.0, 820.0])
-            .with_min_inner_size([620.0, 620.0])
+            .with_min_inner_size([760.0, 600.0])
             .with_title("Vaultling"),
         ..Default::default()
     };
@@ -4334,6 +4635,74 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(id: i64, name: &str, kind: Kind, updated_at: i64) -> Row {
+        Row {
+            id,
+            favorite: false,
+            updated_at,
+            name: name.into(),
+            username: String::new(),
+            uri: None,
+            totp: None,
+            tags: None,
+            notes: None,
+            password: String::new(),
+            kind,
+            fields: vec![],
+        }
+    }
+
+    fn names(rows: &[Row]) -> Vec<&str> {
+        rows.iter().map(|r| r.name.as_str()).collect()
+    }
+
+    #[test]
+    fn every_sort_order_is_deterministic() {
+        let mut rows = vec![
+            row(1, "beta", Kind::Website, 30),
+            row(2, "Alpha", Kind::Email, 10),
+            row(3, "gamma", Kind::Website, 20),
+        ];
+        sort_rows(&mut rows, Sort::Name);
+        assert_eq!(names(&rows), ["Alpha", "beta", "gamma"]);
+        sort_rows(&mut rows, Sort::Recent);
+        assert_eq!(names(&rows), ["gamma", "Alpha", "beta"]);
+        sort_rows(&mut rows, Sort::Updated);
+        assert_eq!(names(&rows), ["beta", "gamma", "Alpha"]);
+        sort_rows(&mut rows, Sort::Category);
+        let kinds: Vec<_> = rows.iter().map(|r| r.kind.label()).collect();
+        let mut sorted = kinds.clone();
+        sorted.sort();
+        assert_eq!(kinds, sorted);
+    }
+
+    #[test]
+    fn sort_cycle_visits_every_mode_and_returns() {
+        let mut s = Sort::Name;
+        let mut seen = vec![s.label()];
+        for _ in 0..3 {
+            s = s.next();
+            seen.push(s.label());
+        }
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 4);
+        assert!(s.next() == Sort::Name);
+    }
+
+    #[test]
+    fn kind_counts_are_largest_first_and_skip_empty() {
+        let rows = vec![
+            row(1, "a", Kind::Email, 0),
+            row(2, "b", Kind::Website, 0),
+            row(3, "c", Kind::Website, 0),
+        ];
+        let c = kind_counts(&rows);
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[0], (Kind::Website, 2));
+        assert!(kind_counts(&[]).is_empty());
+    }
 
     #[test]
     fn wipe_secrets_empties_rows_and_history() {

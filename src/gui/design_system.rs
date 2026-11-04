@@ -63,8 +63,50 @@ pub const LIGHT: Palette = Palette {
     ok: egui::Color32::from_rgb(0x1a, 0x7f, 0x4b),
 };
 
+/// High-contrast dark: near-black on pure white-ish text, saturated accents.
+const HC_DARK: Palette = Palette {
+    bg: egui::Color32::from_rgb(0x00, 0x00, 0x00),
+    surface: egui::Color32::from_rgb(0x0a, 0x0a, 0x0a),
+    surface_hi: egui::Color32::from_rgb(0x24, 0x24, 0x24),
+    line: egui::Color32::from_rgb(0x9a, 0x9a, 0x9a),
+    accent: egui::Color32::from_rgb(0xff, 0xd1, 0x4d),
+    on_accent: egui::Color32::from_rgb(0x00, 0x00, 0x00),
+    text: egui::Color32::from_rgb(0xff, 0xff, 0xff),
+    muted: egui::Color32::from_rgb(0xd0, 0xd0, 0xd0),
+    danger: egui::Color32::from_rgb(0xff, 0x8a, 0x8a),
+    warn: egui::Color32::from_rgb(0xff, 0xc8, 0x5a),
+    ok: egui::Color32::from_rgb(0x6e, 0xff, 0xa8),
+};
+
+/// High-contrast light.
+const HC_LIGHT: Palette = Palette {
+    bg: egui::Color32::from_rgb(0xff, 0xff, 0xff),
+    surface: egui::Color32::from_rgb(0xff, 0xff, 0xff),
+    surface_hi: egui::Color32::from_rgb(0xe2, 0xe2, 0xe2),
+    line: egui::Color32::from_rgb(0x40, 0x40, 0x40),
+    accent: egui::Color32::from_rgb(0x7a, 0x4a, 0x00),
+    on_accent: egui::Color32::from_rgb(0xff, 0xff, 0xff),
+    text: egui::Color32::from_rgb(0x00, 0x00, 0x00),
+    muted: egui::Color32::from_rgb(0x30, 0x30, 0x30),
+    danger: egui::Color32::from_rgb(0x9a, 0x00, 0x00),
+    warn: egui::Color32::from_rgb(0x6b, 0x4f, 0x00),
+    ok: egui::Color32::from_rgb(0x00, 0x62, 0x2e),
+};
+
 thread_local! {
     static PALETTE: std::cell::Cell<Palette> = const { std::cell::Cell::new(DARK) };
+    static HIGH_CONTRAST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Switch the high-contrast variant on or off. Takes effect at the next
+/// [`set_palette`] call.
+pub fn set_high_contrast(on: bool) {
+    HIGH_CONTRAST.with(|c| c.set(on));
+}
+
+/// Whether high contrast is requested.
+pub fn high_contrast() -> bool {
+    HIGH_CONTRAST.with(|c| c.get())
 }
 
 /// Get the current palette.
@@ -74,7 +116,13 @@ pub fn palette() -> Palette {
 
 /// Set the active palette (light or dark).
 pub fn set_palette(light: bool) {
-    PALETTE.with(|c| c.set(if light { LIGHT } else { DARK }));
+    let p = match (light, high_contrast()) {
+        (false, false) => DARK,
+        (true, false) => LIGHT,
+        (false, true) => HC_DARK,
+        (true, true) => HC_LIGHT,
+    };
+    PALETTE.with(|c| c.set(p));
 }
 
 /// Typography scale with semantic names.
@@ -377,4 +425,56 @@ pub fn strong_text(text: impl Into<String>, size: f32, color: egui::Color32) -> 
 /// Helper to create monospace styled text.
 pub fn mono_text(text: impl Into<String>, size: f32, color: egui::Color32) -> egui::RichText {
     egui::RichText::new(text).size(size).monospace().color(color)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lum(c: egui::Color32) -> f32 {
+        let f = |v: u8| {
+            let v = v as f32 / 255.0;
+            if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * f(c.r()) + 0.7152 * f(c.g()) + 0.0722 * f(c.b())
+    }
+
+    fn ratio(a: egui::Color32, b: egui::Color32) -> f32 {
+        let (x, y) = (lum(a), lum(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    #[test]
+    fn body_text_meets_wcag_aa_in_every_palette() {
+        for (name, p) in [("dark", DARK), ("light", LIGHT)] {
+            assert!(ratio(p.text, p.bg) >= 4.5, "{name} text/bg");
+            assert!(ratio(p.text, p.surface) >= 4.5, "{name} text/surface");
+        }
+    }
+
+    #[test]
+    fn high_contrast_meets_wcag_aaa() {
+        for (name, p) in [("hc dark", HC_DARK), ("hc light", HC_LIGHT)] {
+            for bg in [p.bg, p.surface] {
+                assert!(ratio(p.text, bg) >= 7.0, "{name} text");
+                assert!(ratio(p.muted, bg) >= 7.0, "{name} muted");
+                assert!(ratio(p.accent, bg) >= 4.5, "{name} accent");
+                assert!(ratio(p.danger, bg) >= 4.5, "{name} danger");
+                assert!(ratio(p.ok, bg) >= 4.5, "{name} ok");
+                assert!(ratio(p.warn, bg) >= 4.5, "{name} warn");
+            }
+            assert!(ratio(p.on_accent, p.accent) >= 4.5, "{name} on_accent");
+            assert!(ratio(p.line, p.bg) >= 3.0, "{name} line");
+        }
+    }
+
+    #[test]
+    fn set_palette_honours_the_flag() {
+        set_high_contrast(true);
+        set_palette(false);
+        assert_eq!(palette().text, HC_DARK.text);
+        set_high_contrast(false);
+        set_palette(true);
+        assert_eq!(palette().bg, LIGHT.bg);
+        set_palette(false);
+    }
 }

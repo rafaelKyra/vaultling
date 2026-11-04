@@ -13,6 +13,28 @@ pub struct ThreePaneLayout {
     pub detail_width: f32,
 }
 
+/// Narrowest the centre list may become before the side panes give way.
+pub const MIN_CENTER: f32 = 260.0;
+
+/// Pane widths for a window `total` pixels wide.
+///
+/// Returns `(sidebar, detail)`. At full size these are the configured widths;
+/// in a narrow window both shrink proportionally so the centre list keeps at
+/// least [`MIN_CENTER`] pixels, down to a floor below which a pane stops being
+/// usable (the window's own minimum size keeps us above it).
+pub fn pane_widths(total: f32, sidebar: f32, detail: f32) -> (f32, f32) {
+    const SIDEBAR_MIN: f32 = 150.0;
+    const DETAIL_MIN: f32 = 240.0;
+    // Margins and separators the panels spend on themselves.
+    const CHROME: f32 = 70.0;
+    let room = (total - MIN_CENTER - CHROME).max(SIDEBAR_MIN + DETAIL_MIN);
+    if sidebar + detail <= room {
+        return (sidebar, detail);
+    }
+    let k = room / (sidebar + detail);
+    ((sidebar * k).max(SIDEBAR_MIN), (detail * k).max(DETAIL_MIN))
+}
+
 impl ThreePaneLayout {
     /// Create a new three-pane layout with default widths.
     pub fn new() -> Self {
@@ -53,10 +75,13 @@ impl ThreePaneLayout {
         F2: FnOnce(&mut egui::Ui, &mut App),
         F3: FnOnce(&mut egui::Ui, &mut App),
     {
+        let total = ctx.screen_rect().width();
+        let (sw, dw) = pane_widths(total, self.sidebar_width, self.detail_width);
         // Sidebar (left)
         egui::SidePanel::left("three_pane_sidebar")
             .resizable(true)
-            .default_width(self.sidebar_width)
+            .default_width(sw)
+            .width_range(150.0..=(total * 0.4).max(150.0))
             .frame(
                 egui::Frame::none()
                     .fill(ctx.style().visuals.panel_fill)
@@ -67,7 +92,8 @@ impl ThreePaneLayout {
         // Detail pane (right)
         egui::SidePanel::right("three_pane_detail")
             .resizable(true)
-            .default_width(self.detail_width)
+            .default_width(dw)
+            .width_range(240.0..=(total * 0.55).max(240.0))
             .frame(
                 egui::Frame::none()
                     .fill(ctx.style().visuals.panel_fill)
@@ -162,6 +188,20 @@ mod tests {
         }
         assert!(rects["sidebar"].right() <= rects["center"].left() + 1.0);
         assert!(rects["center"].right() <= rects["detail"].left() + 1.0);
+    }
+
+    #[test]
+    fn pane_widths_keep_the_centre_usable() {
+        // Roomy window: configured widths untouched.
+        assert_eq!(pane_widths(1600.0, 236.0, 376.0), (236.0, 376.0));
+        // Narrow windows shrink the side panes, never below their floors.
+        for total in [760.0_f32, 800.0, 980.0] {
+            let (s, d) = pane_widths(total, 236.0, 376.0);
+            assert!(s >= 150.0 && d >= 240.0, "{total}: {s} {d}");
+            if total >= 760.0 {
+                assert!(total - s - d - 70.0 >= MIN_CENTER - 1.0, "{total}: {s} {d}");
+            }
+        }
     }
 
     #[test]

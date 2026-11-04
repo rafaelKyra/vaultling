@@ -64,16 +64,17 @@ Legend: done / partial / missing. Evidence is in `src/bin/vaultling-gui.rs` unle
 | Design tokens, light/dark palette | done | `src/gui/design_system.rs`, `palette()`/`set_palette` |
 | Hardcoded colours replaced | partial | `apply_theme` still sets some literal `Color32` values |
 | Three-pane layout | done (fixed) | `src/gui/layout.rs`; slot-order bug fixed, tests added |
-| Responsive breakpoints | missing | panels are resizable, no collapse at small widths |
-| Keyboard shortcuts (Ctrl+L, Ctrl+C, Esc, /) | partial | no `?` overlay, no list arrow-key navigation |
+| Responsive breakpoints | done | `pane_widths` in `src/gui/layout.rs`, min window 760x600 |
+| Keyboard shortcuts | done | arrows/j/k, `?` overlay, typing-safe guards |
 | Password generator | done | `generate_password` |
 | Strength meter | done | `strength`, `meter` |
 | Entry types / categories (16 kinds) | done | `vaultling::kind` |
-| Tags, favourites, sort (name/recent) | partial | sort by created/category missing |
-| Multi-select / bulk actions | missing | |
+| Tags, favourites, sort | done | name, newest, edited, category |
+| Multi-select / bulk actions | done | Select mode: favourite, move to trash |
 | TOTP in detail with countdown | done | detail pane; not shown in list rows |
 | Password history | done | `history_rows` |
-| Stats dashboard, onboarding, high contrast | missing | health score only |
+| Stats dashboard, high contrast | done | `stats_view`, `HC_*` palettes |
+| Onboarding wizard | missing | only the empty-vault state |
 
 Implementation order: finish visual foundation and navigation (rows marked
 partial in the first half of the table) before any new feature.
