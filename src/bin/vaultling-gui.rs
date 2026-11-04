@@ -1985,13 +1985,9 @@ impl eframe::App for App {
         // timer rather than only on input. Slower when locked: nothing there
         // needs sixty frames a second, and a vault should not spin a laptop fan
         // while it sits waiting for a passphrase.
-        ctx.request_repaint_after(Duration::from_millis(if self.db.is_some() {
-            500
-        } else if reduced_motion() {
-            500
-        } else {
-            50
-        }));
+        ctx.request_repaint_after(Duration::from_millis(
+            if self.db.is_some() || reduced_motion() { 500 } else { 50 },
+        ));
 
         if ctx.input(|i| !i.events.is_empty() || i.pointer.velocity() != egui::Vec2::ZERO) {
             self.last_input = Instant::now();
