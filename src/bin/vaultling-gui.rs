@@ -13,80 +13,12 @@ use eframe::egui;
 use rand_core::{OsRng, RngCore};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use vaultling::gui::design_system::{palette, set_palette};
+use vaultling::gui::layout::show_three_pane;
 use vaultling::key_lifecycle::{KeySession, MasterKey};
 use vaultling::kind::{self, Kind};
 use vaultling::storage::{EntryDraft, VaultDatabase};
 use vaultling::totp;
-
-// ── Palette ─────────────────────────────────────────────────────────────────
-//
-// Two themes, one set of roles. Naming the roles rather than the colours means
-// every widget below is written once: swapping the theme swaps the values, not
-// the code — and no screen can drift into a hardcoded colour that stays dark
-// when everything around it turns light.
-
-#[derive(Clone, Copy)]
-struct Palette {
-    bg: egui::Color32,
-    surface: egui::Color32,
-    surface_hi: egui::Color32,
-    line: egui::Color32,
-    accent: egui::Color32,
-    text: egui::Color32,
-    muted: egui::Color32,
-    danger: egui::Color32,
-    warn: egui::Color32,
-    ok: egui::Color32,
-    /// Text drawn ON the accent colour. Dark on a light theme, and vice versa —
-    /// the one value that must not simply follow `text`, or primary buttons
-    /// become unreadable.
-    on_accent: egui::Color32,
-}
-
-const DARK: Palette = Palette {
-    bg: egui::Color32::from_rgb(0x11, 0x13, 0x18),
-    surface: egui::Color32::from_rgb(0x1a, 0x1d, 0x24),
-    surface_hi: egui::Color32::from_rgb(0x25, 0x29, 0x33),
-    line: egui::Color32::from_rgb(0x2a, 0x2f, 0x3a),
-    accent: egui::Color32::from_rgb(0xe8, 0xb3, 0x4a),
-    text: egui::Color32::from_rgb(0xe8, 0xea, 0xef),
-    muted: egui::Color32::from_rgb(0x8c, 0x93, 0xa4),
-    danger: egui::Color32::from_rgb(0xff, 0x6b, 0x6b),
-    warn: egui::Color32::from_rgb(0xf0, 0xb4, 0x5f),
-    ok: egui::Color32::from_rgb(0x5d, 0xd6, 0x8e),
-    on_accent: egui::Color32::from_rgb(0x1a, 0x14, 0x05),
-};
-
-const LIGHT: Palette = Palette {
-    bg: egui::Color32::from_rgb(0xf6, 0xf7, 0xf9),
-    surface: egui::Color32::from_rgb(0xff, 0xff, 0xff),
-    surface_hi: egui::Color32::from_rgb(0xe9, 0xec, 0xf1),
-    line: egui::Color32::from_rgb(0xd8, 0xdd, 0xe5),
-    accent: egui::Color32::from_rgb(0xb5, 0x7c, 0x10),
-    text: egui::Color32::from_rgb(0x1a, 0x1d, 0x24),
-    // Darker than the dark theme's muted: grey that reads as "secondary" on
-    // black is nearly invisible on white.
-    muted: egui::Color32::from_rgb(0x5f, 0x67, 0x76),
-    danger: egui::Color32::from_rgb(0xc0, 0x28, 0x28),
-    warn: egui::Color32::from_rgb(0xa8, 0x86, 0x0a),
-    ok: egui::Color32::from_rgb(0x1a, 0x7f, 0x4b),
-    on_accent: egui::Color32::from_rgb(0xff, 0xff, 0xff),
-};
-
-// The palette in force. Set when the theme changes, read by every helper.
-// Thread-local rather than `static mut`: egui draws on one thread, so this is
-// both correct and free, and it needs no `unsafe`.
-thread_local! {
-    static PALETTE: std::cell::Cell<Palette> = const { std::cell::Cell::new(DARK) };
-}
-
-fn pal() -> Palette {
-    PALETTE.with(|c| c.get())
-}
-
-fn set_palette(light: bool) {
-    PALETTE.with(|c| c.set(if light { LIGHT } else { DARK }));
-}
 
 /// How long a copied secret may sit in the clipboard.
 ///
@@ -465,7 +397,7 @@ fn generate_password() -> String {
 /// terrible — so the label always says "estimate".
 fn strength(password: &str) -> (f32, &'static str, egui::Color32) {
     if password.is_empty() {
-        return (0.0, "", pal().muted);
+        return (0.0, "", palette().muted);
     }
     let mut classes = 0u32;
     if password.chars().any(|c| c.is_ascii_lowercase()) { classes += 26; }
@@ -474,10 +406,10 @@ fn strength(password: &str) -> (f32, &'static str, egui::Color32) {
     if password.chars().any(|c| !c.is_ascii_alphanumeric()) { classes += 33; }
     let bits = password.chars().count() as f32 * (classes.max(2) as f32).log2();
     match bits as u32 {
-        0..=45 => (bits, "weak", pal().danger),
-        46..=69 => (bits, "fair", pal().warn),
-        70..=99 => (bits, "good", pal().ok),
-        _ => (bits, "strong", pal().ok),
+        0..=45 => (bits, "weak", palette().danger),
+        46..=69 => (bits, "fair", palette().warn),
+        70..=99 => (bits, "good", palette().ok),
+        _ => (bits, "strong", palette().ok),
     }
 }
 
@@ -930,7 +862,7 @@ fn install_fonts(ctx: &egui::Context) {
 
 fn apply_theme(ctx: &egui::Context, light: bool) {
     set_palette(light);
-    let c = pal();
+    let c = palette();
     let mut v = if light { egui::Visuals::light() } else { egui::Visuals::dark() };
     v.panel_fill = c.bg;
     v.window_fill = c.bg;
@@ -1031,9 +963,9 @@ fn form<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
 /// rather than drawn.
 fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     egui::Frame::none()
-        .fill(pal().surface)
+        .fill(palette().surface)
         .rounding(egui::Rounding::same(14.0))
-        .stroke(egui::Stroke::new(1.0_f32, pal().line))
+        .stroke(egui::Stroke::new(1.0_f32, palette().line))
         .shadow(egui::epaint::Shadow {
             offset: egui::vec2(0.0, 2.0),
             blur: 12.0,
@@ -1105,7 +1037,7 @@ fn logo(ui: &mut egui::Ui, size: f32) {
     // embedded picture cannot be decoded.
     let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
     let p = ui.painter();
-    let c = pal();
+    let c = palette();
     let u = size / 24.0;
     let at = |x: f32, y: f32| {
         egui::pos2(rect.center().x + (x - 12.0) * u, rect.center().y + (y - 12.0) * u)
@@ -1167,7 +1099,7 @@ fn cipher_rain(ui: &mut egui::Ui, rect: egui::Rect, t: f64, intensity: f32) {
     const COLS: usize = 7;
     const GLYPHS: &[u8] = b"0123456789ABCDEF";
     let p = ui.painter().with_clip_rect(rect);
-    let c = pal();
+    let c = palette();
 
     for col in 0..COLS {
         let x = rect.left() + (col as f32 + 0.5) * (rect.width() / COLS as f32);
@@ -1205,6 +1137,7 @@ fn cipher_rain(ui: &mut egui::Ui, rect: egui::Rect, t: f64, intensity: f32) {
 /// nothing to parse, cannot be swapped by someone editing files beside the
 /// binary, take the theme colour for free, and stay crisp at any size or
 /// display scale.
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq)]
 enum Icon {
     Key,
@@ -1297,7 +1230,7 @@ fn kind_color(k: Kind) -> egui::Color32 {
         310.0, // Licence      magenta
     ];
     let hue = HUES[k.as_i64() as usize % 16] / 360.0;
-    let light_bg = pal().bg.r() > 128;
+    let light_bg = palette().bg.r() > 128;
     // `Hsva` is LINEAR, not sRGB: a value of 0.68 comes out around 0.85 on
     // screen. Read as sRGB numbers these look sensible and render washed out,
     // which is how the first version put pastel icons on a white sidebar.
@@ -1628,7 +1561,7 @@ fn icon_button(ui: &mut egui::Ui, glyph: Icon, text: &str) -> bool {
         .scope(|ui| {
             ui.horizontal(|ui| {
                 ui.add_space(9.0);
-                icon(ui, glyph, 14.0, pal().text);
+                icon(ui, glyph, 14.0, palette().text);
                 ui.add_space(5.0);
                 ui.label(egui::RichText::new(text).size(13.0));
                 ui.add_space(9.0);
@@ -1639,9 +1572,9 @@ fn icon_button(ui: &mut egui::Ui, glyph: Icon, text: &str) -> bool {
     let rect = inner.rect.expand2(egui::vec2(0.0, 5.0));
     let click = ui.interact(rect, id, egui::Sense::click());
     let fill = if click.hovered() {
-        pal().accent.linear_multiply(0.45)
+        palette().accent.linear_multiply(0.45)
     } else {
-        pal().surface_hi
+        palette().surface_hi
     };
     painter.set(
         bg,
@@ -1678,7 +1611,7 @@ fn avatar(ui: &mut egui::Ui, name: &str, size: f32) {
         hash = hash.wrapping_mul(16_777_619);
     }
     let hue = (hash % 360) as f32 / 360.0;
-    let fill = egui::ecolor::Hsva::new(hue, 0.55, if pal().bg.r() > 128 { 0.85 } else { 0.55 }, 1.0);
+    let fill = egui::ecolor::Hsva::new(hue, 0.55, if palette().bg.r() > 128 { 0.85 } else { 0.55 }, 1.0);
 
     let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
     ui.painter()
@@ -1723,13 +1656,13 @@ fn nav_row(
     if selected {
         p.rect_filled(rect, egui::Rounding::same(7.0), tint.linear_multiply(0.20));
     } else if resp.hovered() {
-        p.rect_filled(rect, egui::Rounding::same(7.0), pal().surface_hi);
+        p.rect_filled(rect, egui::Rounding::same(7.0), palette().surface_hi);
     }
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
 
-    let text_color = if selected { tint } else if strong { pal().text } else { pal().muted };
+    let text_color = if selected { tint } else if strong { palette().text } else { palette().muted };
     let mut x = rect.left() + indent;
     if let Some(g) = glyph {
         const S: f32 = 14.0;
@@ -1749,10 +1682,10 @@ fn nav_row(
         let galley = p.layout_no_wrap(
             n.to_string(),
             egui::FontId::proportional(11.5),
-            if selected { tint } else { pal().muted },
+            if selected { tint } else { palette().muted },
         );
         let at = egui::pos2(right - galley.size().x, rect.center().y - galley.size().y / 2.0);
-        p.galley(at, galley.clone(), pal().text);
+        p.galley(at, galley.clone(), palette().text);
         right -= galley.size().x + 10.0;
     }
 
@@ -1793,7 +1726,7 @@ fn disclosure(p: &egui::Painter, rect: egui::Rect, open: bool, color: egui::Colo
 }
 
 fn label(ui: &mut egui::Ui, text: &str) {
-    ui.label(egui::RichText::new(text).size(12.0).color(pal().muted));
+    ui.label(egui::RichText::new(text).size(12.0).color(palette().muted));
 }
 
 fn field(ui: &mut egui::Ui, value: &mut String, hint: &str, secret: bool) -> egui::Response {
@@ -1809,8 +1742,8 @@ fn field(ui: &mut egui::Ui, value: &mut String, hint: &str, secret: bool) -> egu
 fn primary(ui: &mut egui::Ui, text: &str) -> bool {
     ui.add_sized(
         [130.0, 34.0],
-        egui::Button::new(egui::RichText::new(text).size(14.0).strong().color(pal().on_accent))
-            .fill(pal().accent),
+        egui::Button::new(egui::RichText::new(text).size(14.0).strong().color(palette().on_accent))
+            .fill(palette().accent),
     )
     .clicked()
 }
@@ -2045,7 +1978,7 @@ impl eframe::App for App {
             egui::TopBottomPanel::top("head")
                 .frame(
                     egui::Frame::none()
-                        .fill(pal().bg)
+                        .fill(palette().bg)
                         .inner_margin(egui::Margin::symmetric(20.0, 14.0)),
                 )
                 .show(ctx, |ui| self.header(ui));
@@ -2055,90 +1988,60 @@ impl eframe::App for App {
         // the first screen reads as a rendering fault.
         if self.db.is_some() || !self.status.is_empty() {
         egui::TopBottomPanel::bottom("status")
-            .frame(egui::Frame::none().fill(pal().surface).inner_margin(egui::Margin::symmetric(20.0, 8.0)))
+            .frame(egui::Frame::none().fill(palette().surface).inner_margin(egui::Margin::symmetric(20.0, 8.0)))
             .show(ctx, |ui| self.status_bar(ui));
         }
 
         if browsing {
-            egui::SidePanel::left("nav")
-                .resizable(true)
-                .default_width(236.0)
-                .frame(egui::Frame::none().fill(pal().bg).inner_margin(egui::Margin::symmetric(16.0, 14.0)))
-                .show(ctx, |ui| self.sidebar(ui));
-
-            // The detail pane holds a copy of the selected row rather than a
-            // borrow, because drawing it mutates self (copy timestamps, panel
-            // switches) and the borrow checker is right to refuse both at once.
-            // The detail pane is always there, even with nothing selected.
-            // Letting it appear and disappear made the list jump sideways on
-            // every click, which is disorienting in a way people feel without
-            // being able to name.
-            let selected = self
-                .open_entry
-                .and_then(|id| self.rows.iter().find(|r| r.id == id).cloned());
-            egui::SidePanel::right("details")
-                .resizable(true)
-                .default_width(376.0)
-                .frame(
-                    egui::Frame::none()
-                        .fill(pal().bg)
-                        .inner_margin(egui::Margin::symmetric(16.0, 14.0)),
-                )
-                .show(ctx, |ui| match selected {
-                    Some(row) => {
-                        egui::ScrollArea::vertical().show(ui, |ui| self.detail(ui, &row));
+            show_three_pane(
+                ctx,
+                self,
+                |ui, app| app.sidebar(ui),
+                |ui, app| {
+                    if app.db.is_some() {
+                        app.unlocked(ui);
+                    } else if app.show_help_locked {
+                        app.help_view(ui);
+                    } else if app.creating {
+                        app.create_view(ui);
+                    } else {
+                        app.locked(ui);
                     }
-                    None => {
-                        // The cipher rain, kept alive inside the unlocked
-                        // window — but only here, in the one pane that is
-                        // genuinely empty. Behind the list or the editor it
-                        // would be moving texture under text somebody is
-                        // reading, which is decoration bought with legibility.
-                        //
-                        // A third of the lock screen's intensity: at the lock
-                        // screen it is the subject, here it is the wallpaper,
-                        // and something you sit in front of all day must be
-                        // quiet enough to ignore.
-                        let t = ui.input(|i| i.time);
-                        let rect = ui.available_rect_before_wrap();
-                        cipher_rain(ui, rect, t, 0.16);
-                        // Repaint only while this pane is showing, so an idle
-                        // window with an entry open is not animating anything.
-                        ui.ctx().request_repaint_after(Duration::from_millis(60));
-
-                        ui.add_space(ui.available_height() * 0.30);
-                        ui.vertical_centered(|ui| {
-                            logo(ui, 46.0);
-                            ui.add_space(12.0);
-                            ui.label(
-                                egui::RichText::new("Nothing selected")
-                                    .size(14.0)
-                                    .color(pal().text),
-                            );
-                            ui.add_space(2.0);
-                            ui.label(
-                                egui::RichText::new("Pick an entry to see it here")
-                                    .size(11.5)
-                                    .color(pal().muted),
-                            );
-                        });
+                },
+                |ui, app| {
+                    let selected = app
+                        .open_entry
+                        .and_then(|id| app.rows.iter().find(|r| r.id == id).cloned());
+                    match selected {
+                        Some(row) => {
+                            egui::ScrollArea::vertical().show(ui, |ui| app.detail(ui, &row));
+                        }
+                        None => {
+                            let t = ui.input(|i| i.time);
+                            let rect = ui.available_rect_before_wrap();
+                            cipher_rain(ui, rect, t, 0.16);
+                            ui.ctx().request_repaint_after(Duration::from_millis(60));
+                            ui.add_space(ui.available_height() * 0.30);
+                            ui.vertical_centered(|ui| {
+                                logo(ui, 46.0);
+                                ui.add_space(12.0);
+                                ui.label(
+                                    egui::RichText::new("Nothing selected")
+                                        .size(14.0)
+                                        .color(palette().text),
+                                );
+                                ui.add_space(2.0);
+                                ui.label(
+                                    egui::RichText::new("Pick an entry to see it here")
+                                        .size(11.5)
+                                        .color(palette().muted),
+                                );
+                            });
+                        }
                     }
-                });
+                },
+            );
         }
-
-        egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(pal().bg).inner_margin(egui::Margin::symmetric(16.0, 14.0)))
-            .show(ctx, |ui| {
-                if self.db.is_some() {
-                    self.unlocked(ui);
-                } else if self.show_help_locked {
-                    self.help_view(ui);
-                } else if self.creating {
-                    self.create_view(ui);
-                } else {
-                    self.locked(ui);
-                }
-            });
     }
 }
 
@@ -2153,13 +2056,13 @@ impl App {
         ui.horizontal(|ui| {
             if !self.status.is_empty() {
                 let color = match self.level {
-                    Level::Ok => pal().ok,
-                    Level::Bad => pal().danger,
-                    Level::None => pal().muted,
+                    Level::Ok => palette().ok,
+                    Level::Bad => palette().danger,
+                    Level::None => palette().muted,
                 };
                 ui.label(egui::RichText::new(&self.status).size(12.0).color(color));
             } else if let Some(p) = &self.vault_path {
-                ui.label(egui::RichText::new(p.display().to_string()).size(11.0).color(pal().muted));
+                ui.label(egui::RichText::new(p.display().to_string()).size(11.0).color(palette().muted));
             }
 
             if self.db.is_some() {
@@ -2167,7 +2070,7 @@ impl App {
                     let left = IDLE_LOCK.saturating_sub(self.last_input.elapsed()).as_secs();
                     let (m, sec) = (left / 60, left % 60);
                     // Warn while there is still time to do something about it.
-                    let color = if left <= 60 { pal().warn } else { pal().muted };
+                    let color = if left <= 60 { palette().warn } else { palette().muted };
                     ui.label(
                         egui::RichText::new(format!("locks in {m}:{sec:02}"))
                             .size(12.0)
@@ -2176,7 +2079,7 @@ impl App {
                     ui.add_space(12.0);
                     let report = self.security_report();
                     let sc = report.score;
-                    let color = if sc >= 85 { pal().ok } else if sc >= 60 { pal().warn } else { pal().danger };
+                    let color = if sc >= 85 { palette().ok } else if sc >= 60 { palette().warn } else { palette().danger };
                     ui.label(
                         egui::RichText::new(format!("health {sc}"))
                             .size(12.0)
@@ -2244,7 +2147,7 @@ impl App {
                 ui.label(
                     egui::RichText::new(format!("{shown} of {total}"))
                         .size(11.0)
-                        .color(pal().muted),
+                        .color(palette().muted),
                 );
                 if ui.small_button("clear").clicked() {
                     self.filter.clear();
@@ -2258,7 +2161,7 @@ impl App {
             // ── Totals ───────────────────────────────────────────────────
             let all_selected = self.tag_filter.is_none() && self.kind_filter.is_none();
             if nav_row(ui, Some(Icon::Stack), "All entries", Some(total), all_selected,
-                       pal().accent, 2.0, true).clicked()
+                       palette().accent, 2.0, true).clicked()
             {
                 self.tag_filter = None;
                 self.kind_filter = None;
@@ -2268,7 +2171,7 @@ impl App {
             if favs > 0 {
                 let on = self.tag_filter.as_deref() == Some("\u{2605}");
                 if nav_row(ui, Some(Icon::Shield), "Favourites", Some(favs), on,
-                           pal().accent, 2.0, true).clicked()
+                           palette().accent, 2.0, true).clicked()
                 {
                     self.tag_filter = if on { None } else { Some("\u{2605}".into()) };
                 }
@@ -2295,7 +2198,7 @@ impl App {
                 let open = !self.collapsed_groups.contains(&g);
 
                 let resp = nav_row(ui, None, g.label(), Some(subtotal), false,
-                                   pal().accent, 16.0, true);
+                                   palette().accent, 16.0, true);
                 // The triangle is painted after the row so it sits on top of
                 // the hover fill rather than under it.
                 disclosure(
@@ -2305,7 +2208,7 @@ impl App {
                         egui::vec2(12.0, 12.0),
                     ),
                     open,
-                    pal().muted,
+                    palette().muted,
                 );
                 if resp.clicked() {
                     if open {
@@ -2349,7 +2252,7 @@ impl App {
                 ui.add_space(3.0);
                 for (tag, n) in counts {
                     let on = self.tag_filter.as_deref() == Some(tag.as_str());
-                    if nav_row(ui, Some(Icon::Tag), &tag, Some(n), on, pal().accent, 2.0, true)
+                    if nav_row(ui, Some(Icon::Tag), &tag, Some(n), on, palette().accent, 2.0, true)
                         .clicked()
                     {
                         self.tag_filter = if on { None } else { Some(tag.clone()) };
@@ -2364,7 +2267,7 @@ impl App {
             let report = self.security_report();
             let sc = report.score;
             let color =
-                if sc >= 85 { pal().ok } else if sc >= 60 { pal().warn } else { pal().danger };
+                if sc >= 85 { palette().ok } else if sc >= 60 { palette().warn } else { palette().danger };
             ui.label(egui::RichText::new(format!("{sc}")).size(30.0).strong().color(color));
             ui.add_space(2.0);
             // Slim: this is a status line, not the subject of the pane. At full
@@ -2378,16 +2281,16 @@ impl App {
             );
             ui.add_space(6.0);
             for (n, what, c) in [
-                (report.reused, "reused", pal().danger),
-                (report.weak, "weak", pal().warn),
-                (report.stale, "over a year old", pal().muted),
+                (report.reused, "reused", palette().danger),
+                (report.weak, "weak", palette().warn),
+                (report.stale, "over a year old", palette().muted),
             ] {
                 if n > 0 {
                     ui.label(egui::RichText::new(format!("{n} {what}")).size(11.0).color(c));
                 }
             }
             if report.findings.is_empty() && total > 0 {
-                ui.label(egui::RichText::new("nothing to fix").size(11.0).color(pal().ok));
+                ui.label(egui::RichText::new("nothing to fix").size(11.0).color(palette().ok));
             }
             ui.add_space(8.0);
         });
@@ -2403,7 +2306,7 @@ impl App {
                     egui::RichText::new("Vaultling")
                         .size(21.0)
                         .strong()
-                        .color(pal().text),
+                        .color(palette().text),
                 );
                 ui.label(
                     egui::RichText::new(format!(
@@ -2411,7 +2314,7 @@ impl App {
                         env!("CARGO_PKG_VERSION")
                     ))
                         .size(10.5)
-                        .color(pal().muted),
+                        .color(palette().muted),
                 );
             });
             if self.db.is_some() {
@@ -2451,12 +2354,12 @@ impl App {
         ui.vertical_centered(|ui| {
             logo(ui, 52.0);
             ui.add_space(10.0);
-            ui.label(egui::RichText::new("Vaultling").size(26.0).strong().color(pal().text));
+            ui.label(egui::RichText::new("Vaultling").size(26.0).strong().color(palette().text));
             ui.add_space(3.0);
             ui.label(
                 egui::RichText::new("Your keys and passwords, kept on this machine and nowhere else")
                     .size(12.5)
-                    .color(pal().muted),
+                    .color(palette().muted),
             );
             ui.add_space(2.0);
             ui.label(
@@ -2465,7 +2368,7 @@ impl App {
                     env!("CARGO_PKG_VERSION")
                 ))
                 .size(11.0)
-                .color(pal().muted),
+                .color(palette().muted),
             );
         });
         ui.add_space(18.0);
@@ -2479,11 +2382,11 @@ impl App {
             ui.label(
                 egui::RichText::new(format!("found in {}", home().display()))
                     .size(11.0)
-                    .color(pal().muted),
+                    .color(palette().muted),
             );
             ui.add_space(4.0);
             if self.vaults.is_empty() {
-                ui.label(egui::RichText::new("None found in your home folder.").color(pal().muted));
+                ui.label(egui::RichText::new("None found in your home folder.").color(palette().muted));
             } else {
                 let vaults = self.vaults.clone();
                 egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
@@ -2498,10 +2401,10 @@ impl App {
                             .unwrap_or_default();
                         let t = if chosen {
                             egui::RichText::new(format!("  {name}   {size}"))
-                                .color(pal().accent)
+                                .color(palette().accent)
                                 .strong()
                         } else {
-                            egui::RichText::new(format!("  {name}   {size}")).color(pal().text)
+                            egui::RichText::new(format!("  {name}   {size}")).color(palette().text)
                         };
                         if ui.selectable_label(chosen, t).clicked() {
                             self.selected = Some(path.clone());
@@ -2547,7 +2450,7 @@ impl App {
                      vault is gone — that is what makes it a second factor.",
                 )
                 .size(11.0)
-                .color(pal().muted),
+                .color(palette().muted),
             );
 
             ui.add_space(8.0);
@@ -2555,12 +2458,12 @@ impl App {
                 Some(p) => ui.label(
                     egui::RichText::new(format!("Will open: {}", p.display()))
                         .size(11.0)
-                        .color(pal().muted),
+                        .color(palette().muted),
                 ),
                 None => ui.label(
                     egui::RichText::new("Pick a vault above, or type a path")
                         .size(11.0)
-                        .color(pal().warn),
+                        .color(palette().warn),
                 ),
             };
 
@@ -2598,7 +2501,7 @@ impl App {
     fn browse_view(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         egui::Frame::none()
-            .fill(pal().surface_hi)
+            .fill(palette().surface_hi)
             .rounding(egui::Rounding::same(8.0))
             .inner_margin(egui::Margin::symmetric(10.0, 8.0))
             .show(ui, |ui| {
@@ -2616,7 +2519,7 @@ impl App {
                     ui.label(
                         egui::RichText::new(self.browse_dir.display().to_string())
                             .size(11.0)
-                            .color(pal().muted),
+                            .color(palette().muted),
                     );
                 });
                 ui.add_space(4.0);
@@ -2648,7 +2551,7 @@ impl App {
                         ui.label(
                             egui::RichText::new(format!("cannot read this folder — {e}"))
                                 .size(11.5)
-                                .color(pal().danger),
+                                .color(palette().danger),
                         );
                     }
                 }
@@ -2659,7 +2562,7 @@ impl App {
                     ui.label(
                         egui::RichText::new("nothing here to open")
                             .size(11.5)
-                            .color(pal().muted),
+                            .color(palette().muted),
                     );
                 }
 
@@ -2667,7 +2570,7 @@ impl App {
                     for d in dirs {
                         let name = d.file_name().unwrap_or_default().to_string_lossy().to_string();
                         if nav_row(ui, None, &format!("  {name}/"), None, false,
-                                   pal().accent, 4.0, false).clicked()
+                                   palette().accent, 4.0, false).clicked()
                         {
                             self.browse_dir = d.clone();
                         }
@@ -2685,7 +2588,7 @@ impl App {
                             &name,
                             Some(kb),
                             self.manual_path == f.display().to_string(),
-                            if vault { pal().accent } else { pal().muted },
+                            if vault { palette().accent } else { palette().muted },
                             4.0,
                             vault,
                         );
@@ -2700,7 +2603,7 @@ impl App {
                 ui.label(
                     egui::RichText::new("sizes in KB · only folders and .db files are shown")
                         .size(10.5)
-                        .color(pal().muted),
+                        .color(palette().muted),
                 );
             });
     }
@@ -2729,7 +2632,7 @@ impl App {
                     "There is no recovery. Lose this passphrase and the vault is gone.",
                 )
                 .size(12.0)
-                .color(pal().warn),
+                .color(palette().warn),
             );
             ui.add_space(12.0);
             ui.horizontal(|ui| {
@@ -2883,7 +2786,7 @@ impl App {
                         egui::RichText::new("Your vault is empty")
                             .size(17.0)
                             .strong()
-                            .color(pal().text),
+                            .color(palette().text),
                     );
                     ui.add_space(4.0);
                     ui.label(
@@ -2891,7 +2794,7 @@ impl App {
                             "Add a password, a key, a card or a note — or bring what you already have.",
                         )
                         .size(12.5)
-                        .color(pal().muted),
+                        .color(palette().muted),
                     );
                     ui.add_space(16.0);
                     ui.horizontal(|ui| {
@@ -2909,7 +2812,7 @@ impl App {
                 return;
             }
             if shown.is_empty() {
-                ui.label(egui::RichText::new("Nothing matches that search").color(pal().muted));
+                ui.label(egui::RichText::new("Nothing matches that search").color(palette().muted));
                 return;
             }
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -2926,7 +2829,7 @@ impl App {
                     // can be correct here.
                     let resp = egui::Frame::none()
                         .fill(if selected {
-                            pal().accent.linear_multiply(0.16)
+                            palette().accent.linear_multiply(0.16)
                         } else {
                             egui::Color32::TRANSPARENT
                         })
@@ -2941,7 +2844,7 @@ impl App {
                                         egui::RichText::new(&row.name)
                                             .size(14.0)
                                             .strong()
-                                            .color(if selected { pal().accent } else { pal().text }),
+                                            .color(if selected { palette().accent } else { palette().text }),
                                     );
                                     // The category on the second line, as a
                                     // shape and a word. Without it a mixed
@@ -2959,7 +2862,7 @@ impl App {
                                             sub.push_str("  ·  2FA");
                                         }
                                         ui.label(
-                                            egui::RichText::new(sub).size(11.0).color(pal().muted),
+                                            egui::RichText::new(sub).size(11.0).color(palette().muted),
                                         );
                                     });
                                 });
@@ -2995,7 +2898,7 @@ impl App {
                 avatar(ui, &row.name, 34.0);
                 ui.add_space(6.0);
                 ui.vertical(|ui| {
-                    ui.label(egui::RichText::new(&row.name).size(18.0).strong().color(pal().accent));
+                    ui.label(egui::RichText::new(&row.name).size(18.0).strong().color(palette().accent));
                     // What this is, under what it is called. Two entries named
                     // "Acme" — the login and the API key — are otherwise
                     // indistinguishable at the top of the pane.
@@ -3025,9 +2928,9 @@ impl App {
                                     egui::RichText::new(format!("Copy {}", what.to_lowercase()))
                                         .size(13.5)
                                         .strong()
-                                        .color(pal().on_accent),
+                                        .color(palette().on_accent),
                                 )
-                                .fill(pal().accent),
+                                .fill(palette().accent),
                             )
                             .clicked()
                         {
@@ -3159,7 +3062,7 @@ impl App {
                     // Its own frame, so a pasted key is visibly one block
                     // rather than text that happens to have line breaks.
                     egui::Frame::none()
-                        .fill(pal().surface_hi)
+                        .fill(palette().surface_hi)
                         .rounding(egui::Rounding::same(6.0))
                         .inner_margin(egui::Margin::symmetric(8.0, 6.0))
                         .show(ui, |ui| {
@@ -3190,11 +3093,11 @@ impl App {
                 ui.horizontal_wrapped(|ui| {
                     for t in tags.split(',').map(str::trim).filter(|t| !t.is_empty()) {
                         egui::Frame::none()
-                            .fill(pal().surface_hi)
+                            .fill(palette().surface_hi)
                             .rounding(egui::Rounding::same(10.0))
                             .inner_margin(egui::Margin::symmetric(8.0, 3.0))
                             .show(ui, |ui| {
-                                ui.label(egui::RichText::new(t).size(11.0).color(pal().accent));
+                                ui.label(egui::RichText::new(t).size(11.0).color(palette().accent));
                             });
                     }
                 });
@@ -3230,7 +3133,7 @@ impl App {
                                     .size(24.0)
                                     .monospace()
                                     .strong()
-                                    .color(if hot { pal().warn } else { pal().ok }),
+                                    .color(if hot { palette().warn } else { palette().ok }),
                             );
                             if ui.small_button("Copy").clicked() {
                                 copy_now = Some(code.clone());
@@ -3238,19 +3141,19 @@ impl App {
                             ui.label(
                                 egui::RichText::new(format!("{left}s"))
                                     .size(12.0)
-                                    .color(if hot { pal().warn } else { pal().muted }),
+                                    .color(if hot { palette().warn } else { palette().muted }),
                             );
                         });
                         ui.add(
                             egui::ProgressBar::new(left as f32 / totp::PERIOD as f32)
                                 .desired_width(200.0)
-                                .fill(if hot { pal().warn } else { pal().accent }),
+                                .fill(if hot { palette().warn } else { palette().accent }),
                         );
                     }
                     Err(_) => {
                         ui.label(
                             egui::RichText::new("stored two-factor secret is unreadable")
-                                .color(pal().danger),
+                                .color(palette().danger),
                         );
                     }
                 }
@@ -3289,7 +3192,7 @@ impl App {
                     let fill = if on {
                         tint.linear_multiply(0.30)
                     } else if hot {
-                        pal().surface_hi
+                        palette().surface_hi
                     } else {
                         egui::Color32::TRANSPARENT
                     };
@@ -3314,7 +3217,7 @@ impl App {
                     child.label(
                         egui::RichText::new(k.label())
                             .size(11.5)
-                            .color(if on { pal().text } else { pal().muted }),
+                            .color(if on { palette().text } else { palette().muted }),
                     );
 
                     if hot {
@@ -3418,7 +3321,7 @@ impl App {
                             ui.label(
                                 egui::RichText::new(format!("{} characters stored", value.chars().count()))
                                     .size(11.0)
-                                    .color(pal().muted),
+                                    .color(palette().muted),
                             );
                         }
                     } else {
@@ -3520,7 +3423,7 @@ impl App {
                          its passphrase here.",
                     )
                     .size(11.0)
-                    .color(pal().muted),
+                    .color(palette().muted),
                 );
                 ui.add_space(4.0);
             }
@@ -3551,7 +3454,7 @@ impl App {
                 ui.label(
                     egui::RichText::new("Paste what the site shows next to its QR code.")
                         .size(11.0)
-                        .color(pal().muted),
+                        .color(palette().muted),
                 );
             }
 
@@ -3582,13 +3485,13 @@ impl App {
                 egui::RichText::new("Newest first. Restoring puts the old password back and \
                                      records the current one in its place.")
                     .size(12.0)
-                    .color(pal().muted),
+                    .color(palette().muted),
             );
             ui.add_space(10.0);
 
             if self.history_rows.is_empty() {
                 ui.label(
-                    egui::RichText::new("This password has never been changed.").color(pal().muted),
+                    egui::RichText::new("This password has never been changed.").color(palette().muted),
                 );
             } else {
                 let rows = self.history_rows.clone();
@@ -3597,7 +3500,7 @@ impl App {
                     for (n, (when, old, reason)) in rows.iter().enumerate() {
                         ui.horizontal(|ui| {
                             ui.label(
-                                egui::RichText::new(format!("{}.", n + 1)).size(12.0).color(pal().muted),
+                                egui::RichText::new(format!("{}.", n + 1)).size(12.0).color(palette().muted),
                             );
                             // Masked by default: an old password is usually
                             // still in use somewhere else.
@@ -3606,7 +3509,7 @@ impl App {
                                     .monospace(),
                             );
                             ui.label(
-                                egui::RichText::new(format_when(*when)).size(11.0).color(pal().muted),
+                                egui::RichText::new(format_when(*when)).size(11.0).color(palette().muted),
                             );
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -3622,7 +3525,7 @@ impl App {
                         });
                         if let Some(why) = reason.as_deref().filter(|r| !r.is_empty()) {
                             ui.label(
-                                egui::RichText::new(format!("    {why}")).size(11.0).color(pal().muted),
+                                egui::RichText::new(format!("    {why}")).size(11.0).color(palette().muted),
                             );
                         }
                         ui.separator();
@@ -3679,12 +3582,12 @@ impl App {
                     "Deleted entries stay here until you empty it. Emptying cannot be undone.",
                 )
                 .size(12.0)
-                .color(pal().muted),
+                .color(palette().muted),
             );
             ui.add_space(10.0);
 
             if self.trash_rows.is_empty() {
-                ui.label(egui::RichText::new("The trash is empty.").color(pal().muted));
+                ui.label(egui::RichText::new("The trash is empty.").color(palette().muted));
             } else {
                 let rows = self.trash_rows.clone();
                 let (mut restore, mut purge): (Option<i64>, Option<(i64, String)>) = (None, None);
@@ -3697,7 +3600,7 @@ impl App {
                                 |ui| {
                                     if ui
                                         .small_button(
-                                            egui::RichText::new("Delete forever").color(pal().danger),
+                                            egui::RichText::new("Delete forever").color(palette().danger),
                                         )
                                         .clicked()
                                     {
@@ -3755,7 +3658,7 @@ impl App {
                      detected from the header row.",
                 )
                 .size(12.0)
-                .color(pal().muted),
+                .color(palette().muted),
             );
             ui.add_space(4.0);
             ui.label(
@@ -3764,7 +3667,7 @@ impl App {
                      import is done.",
                 )
                 .size(12.0)
-                .color(pal().warn),
+                .color(palette().warn),
             );
             ui.add_space(10.0);
             label(ui, "CSV FILE");
@@ -3826,7 +3729,7 @@ impl App {
                      keep on a USB stick.",
                 )
                 .size(12.0)
-                .color(pal().muted),
+                .color(palette().muted),
             );
             ui.add_space(6.0);
             if ui.button("Create backup now").clicked() {
@@ -3844,7 +3747,7 @@ impl App {
                      to another manager — delete it immediately afterwards.",
                 )
                 .size(12.0)
-                .color(pal().danger),
+                .color(palette().danger),
             );
             ui.add_space(6.0);
             field(ui, &mut self.export_path, "/home/you/vaultling-export.csv", false);
@@ -3853,9 +3756,9 @@ impl App {
                 .add_sized(
                     [190.0, 32.0],
                     egui::Button::new(
-                        egui::RichText::new("Export unencrypted CSV").size(13.0).color(pal().on_accent),
+                        egui::RichText::new("Export unencrypted CSV").size(13.0).color(palette().on_accent),
                     )
-                    .fill(pal().danger),
+                    .fill(palette().danger),
                 )
                 .clicked()
             {
@@ -3919,7 +3822,7 @@ impl App {
             ui.label(
                 egui::RichText::new("Entries are copied in; the .kdbx file is left untouched.")
                     .size(12.0)
-                    .color(pal().muted),
+                    .color(palette().muted),
             );
             ui.add_space(8.0);
             label(ui, "KDBX FILE");
@@ -3948,7 +3851,7 @@ impl App {
             ui.label(
                 egui::RichText::new("Every entry is re-encrypted under the new key.")
                     .size(12.0)
-                    .color(pal().muted),
+                    .color(palette().muted),
             );
             ui.add_space(8.0);
             label(ui, "CURRENT");
@@ -4009,19 +3912,19 @@ impl App {
             area.show(ui, |ui| {
                 let h = |ui: &mut egui::Ui, t: &str| {
                     ui.add_space(14.0);
-                    ui.label(egui::RichText::new(t).size(15.0).strong().color(pal().accent));
+                    ui.label(egui::RichText::new(t).size(15.0).strong().color(palette().accent));
                     ui.add_space(5.0);
                 };
                 let para = |ui: &mut egui::Ui, t: &str| {
-                    ui.label(egui::RichText::new(t).size(13.5).color(pal().text));
+                    ui.label(egui::RichText::new(t).size(13.5).color(palette().text));
                     ui.add_space(7.0);
                 };
                 // Paths are shown in monospace: a path is something you copy
                 // and type, not something you read as a sentence.
                 let path_line = |ui: &mut egui::Ui, what: &str, p: String| {
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(egui::RichText::new(what).size(12.5).color(pal().muted));
-                        ui.label(egui::RichText::new(p).size(12.5).monospace().color(pal().text));
+                        ui.label(egui::RichText::new(what).size(12.5).color(palette().muted));
+                        ui.label(egui::RichText::new(p).size(12.5).monospace().color(palette().text));
                     });
                     ui.add_space(3.0);
                 };
@@ -4037,7 +3940,7 @@ impl App {
                                 env!("CARGO_PKG_VERSION")
                             ))
                             .size(11.5)
-                            .color(pal().muted),
+                            .color(palette().muted),
                         );
                     });
                 });
@@ -4045,7 +3948,7 @@ impl App {
                 ui.label(
                     egui::RichText::new("Written to be checked, not believed.")
                         .size(12.0)
-                        .color(pal().muted),
+                        .color(palette().muted),
                 );
 
                 h(ui, "What it is");
@@ -4196,7 +4099,7 @@ impl App {
                      0 keeps everything until you empty the trash yourself.",
                 )
                 .size(12.0)
-                .color(pal().muted),
+                .color(palette().muted),
             );
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -4205,7 +4108,7 @@ impl App {
                         .desired_width(70.0)
                         .margin(egui::Margin::symmetric(10.0, 7.0)),
                 );
-                ui.label(egui::RichText::new("days").size(12.0).color(pal().muted));
+                ui.label(egui::RichText::new("days").size(12.0).color(palette().muted));
                 if ui.button("Save").clicked() {
                     match self.retention_input.trim().parse::<i64>() {
                         Ok(d) if d >= 0 => {
@@ -4244,7 +4147,7 @@ impl App {
                      vault sitting beside the ciphertext.",
                 )
                 .size(11.0)
-                .color(pal().muted),
+                .color(palette().muted),
             );
             ui.add_space(4.0);
             let log = self
@@ -4253,7 +4156,7 @@ impl App {
                 .and_then(|db| db.recent_access(12).ok())
                 .unwrap_or_default();
             if log.is_empty() {
-                ui.label(egui::RichText::new("Nothing recorded yet.").size(12.0).color(pal().muted));
+                ui.label(egui::RichText::new("Nothing recorded yet.").size(12.0).color(palette().muted));
             } else {
                 egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
                     for (at, entry, action) in log {
@@ -4269,7 +4172,7 @@ impl App {
                         ui.label(
                             egui::RichText::new(format!("{}   {action}   {who}", format_when(at)))
                                 .size(11.0)
-                                .color(pal().muted),
+                                .color(palette().muted),
                         );
                     }
                 });
@@ -4288,7 +4191,7 @@ impl App {
                 egui::RichText::new(format!("Destroy “{name}” for good?"))
                     .size(17.0)
                     .strong()
-                    .color(pal().danger),
+                    .color(palette().danger),
             );
             ui.add_space(6.0);
             ui.label(
@@ -4298,13 +4201,13 @@ impl App {
                      key dies when you lock the vault.",
                 )
                 .size(12.0)
-                .color(pal().muted),
+                .color(palette().muted),
             );
             ui.add_space(4.0);
             ui.label(
                 egui::RichText::new("There is no undo, and no recovery from a backup made after this.")
                     .size(12.0)
-                    .color(pal().warn),
+                    .color(palette().warn),
             );
             ui.add_space(14.0);
             ui.horizontal(|ui| {
@@ -4312,9 +4215,9 @@ impl App {
                     .add_sized(
                         [150.0, 34.0],
                         egui::Button::new(
-                            egui::RichText::new("Destroy").size(14.0).strong().color(pal().on_accent),
+                            egui::RichText::new("Destroy").size(14.0).strong().color(palette().on_accent),
                         )
-                        .fill(pal().danger),
+                        .fill(palette().danger),
                     )
                     .clicked()
                 {
@@ -4351,19 +4254,19 @@ impl App {
                 egui::RichText::new(format!("Delete “{name}”?"))
                     .size(17.0)
                     .strong()
-                    .color(pal().danger),
+                    .color(palette().danger),
             );
             ui.add_space(4.0);
-            ui.label(egui::RichText::new("This cannot be undone.").size(12.0).color(pal().muted));
+            ui.label(egui::RichText::new("This cannot be undone.").size(12.0).color(palette().muted));
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 if ui
                     .add_sized(
                         [120.0, 34.0],
                         egui::Button::new(
-                            egui::RichText::new("Delete").size(14.0).strong().color(pal().on_accent),
+                            egui::RichText::new("Delete").size(14.0).strong().color(palette().on_accent),
                         )
-                        .fill(pal().danger),
+                        .fill(palette().danger),
                     )
                     .clicked()
                 {

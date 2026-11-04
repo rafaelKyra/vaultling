@@ -21,6 +21,7 @@ pub mod key_lifecycle;
 pub mod redaction;
 pub mod secure_mem;
 pub mod storage;
+pub mod gui;
 
 /// Crate-wide error type.
 #[derive(Debug, thiserror::Error)]
