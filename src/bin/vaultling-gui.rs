@@ -114,6 +114,10 @@ fn group_code(code: &str) -> String {
     }
 }
 
+/// What the KeePass worker thread sends back: the parsed rows and the number
+/// skipped, or an error message.
+type KdbxJob = std::sync::mpsc::Receiver<Result<(Vec<vaultling::import::Incoming>, usize), String>>;
+
 /// The first-run walkthrough, one entry per step: title and body.
 const WELCOME: [(&str, &str); 3] = [
     (
@@ -238,6 +242,8 @@ struct App {
     /// First-run walkthrough: the step being shown, if any, and whether it has
     /// already been offered this session.
     welcome_step: Option<usize>,
+    /// Result of a KeePass file being read on a worker thread.
+    kdbx_job: Option<KdbxJob>,
     welcome_seen: bool,
     /// Show live two-factor codes in the list rows. Off by default: a code
     /// on screen is readable by anyone behind the user.
@@ -307,6 +313,7 @@ impl Default for App {
             high_contrast: false,
             reduce_motion: false,
             welcome_step: None,
+            kdbx_job: None,
             welcome_seen: false,
             list_codes: false,
             rows: Vec::new(),
@@ -767,6 +774,7 @@ impl App {
         self.panel = Panel::List;
         self.show_shortcuts = false;
         self.welcome_step = None;
+        self.kdbx_job = None; // an unfinished import is abandoned, not completed into a locked vault
         self.welcome_seen = false;
         self.list_codes = false;
         self.selecting = false;
@@ -890,25 +898,54 @@ impl App {
         self.set(msg, if done == ids.len() { Level::Ok } else { Level::Bad });
     }
 
+    /// Start a KeePass import. The slow part (decrypting the file: Argon2 and
+    /// the XML) runs on a worker thread so the window keeps drawing; the rest
+    /// happens in `finish_kdbx` once the worker reports back.
     fn import_kdbx(&mut self) {
         let path = self.import_path.trim().to_string();
         if path.is_empty() {
             return self.set("Give the path to a .kdbx file", Level::Bad);
         }
-        let pass = self.import_pass.clone();
-        self.import_pass.clear();
-        let (Some(db), Some(session)) = (self.db.as_ref(), self.session.as_ref()) else {
+        if self.db.is_none() {
             return self.set("vault is locked", Level::Bad);
-        };
+        }
+        if self.kdbx_job.is_some() {
+            return self.set("An import is already running", Level::Bad);
+        }
+        let mut pass = self.import_pass.clone();
+        self.import_pass.clear();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use zeroize::Zeroize;
+            let result = std::fs::File::open(&path)
+                .map_err(|_| "cannot open that file".to_string())
+                .and_then(|mut f| vaultling::import::parse_kdbx(&mut f, &pass));
+            pass.zeroize();
+            let _ = tx.send(result);
+        });
+        self.kdbx_job = Some(rx);
+        self.set("Reading the KeePass file…", Level::None);
+    }
 
+    /// Poll the worker; when it is done, insert what it found.
+    fn poll_kdbx(&mut self) {
+        let Some(rx) = self.kdbx_job.as_ref() else { return };
+        let parsed = match rx.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(_) => Err("the import stopped unexpectedly".to_string()),
+        };
+        self.kdbx_job = None;
+        let (Some(db), Some(session)) = (self.db.as_ref(), self.session.as_ref()) else {
+            return;
+        };
         let mut existing: Vec<(String, String, String)> = self
             .rows
             .iter()
             .map(|r| (r.name.clone(), r.username.clone(), r.password.clone()))
             .collect();
         let result = (|| -> Result<(usize, usize, usize), String> {
-            let mut file = std::fs::File::open(&path).map_err(|_| "cannot open that file")?;
-            let (rows, skipped) = vaultling::import::parse_kdbx(&mut file, &pass)?;
+            let (rows, skipped) = parsed?;
             let (rows, dupes) = vaultling::import::without_duplicates(
                 existing.iter().map(|(n, u, p)| (n.as_str(), u.as_str(), p.as_str())),
                 rows,
@@ -1991,6 +2028,11 @@ impl eframe::App for App {
 
         if ctx.input(|i| !i.events.is_empty() || i.pointer.velocity() != egui::Vec2::ZERO) {
             self.last_input = Instant::now();
+        }
+
+        self.poll_kdbx();
+        if self.kdbx_job.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
 
         // Clipboard hygiene: overwrite rather than clear. An empty clipboard is
