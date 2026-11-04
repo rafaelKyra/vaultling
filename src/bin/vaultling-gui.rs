@@ -4019,10 +4019,19 @@ impl App {
         let (Some(db), Some(session)) = (self.db.as_ref(), self.session.as_ref()) else {
             return self.set("vault is locked", Level::Bad);
         };
-        let result = (|| -> Result<(String, usize, usize), String> {
+        let mut existing: Vec<(String, String, String)> = self
+            .rows
+            .iter()
+            .map(|r| (r.name.clone(), r.username.clone(), r.password.clone()))
+            .collect();
+        let result = (|| -> Result<(String, usize, usize, usize), String> {
             let text = std::fs::read_to_string(&path).map_err(|_| "cannot read that file")?;
             let (source, rows, skipped) =
                 vaultling::import::parse_counting(&text).map_err(|e| e.to_string())?;
+            let (rows, dupes) = vaultling::import::without_duplicates(
+                existing.iter().map(|(n, u, p)| (n.as_str(), u.as_str(), p.as_str())),
+                rows,
+            );
             for r in &rows {
                 db.insert_entry_full(
                     session, &r.name, &r.username, &r.password,
@@ -4031,18 +4040,27 @@ impl App {
                 )
                 .map_err(|e| e.to_string())?;
             }
-            Ok((source.name().to_string(), rows.len(), skipped))
+            Ok((source.name().to_string(), rows.len(), skipped, dupes))
         })();
+        {
+            // The comparison copies are decrypted passwords; overwrite them.
+            use zeroize::Zeroize;
+            for e in existing.iter_mut() {
+                e.2.zeroize();
+            }
+        }
         match result {
-            Ok((source, n, skipped)) => {
+            Ok((source, n, skipped, dupes)) => {
                 self.csv_path.clear();
                 self.reload();
                 self.panel = Panel::List;
-                let note = if skipped > 0 {
-                    format!(", {skipped} skipped (no password)")
-                } else {
-                    String::new()
-                };
+                let mut note = String::new();
+                if skipped > 0 {
+                    note.push_str(&format!(", {skipped} skipped (no password)"));
+                }
+                if dupes > 0 {
+                    note.push_str(&format!(", {dupes} already in the vault"));
+                }
                 self.set(format!("Imported {n} entries from {source}{note}"), Level::Ok);
             }
             Err(why) => self.set(why, Level::Bad),

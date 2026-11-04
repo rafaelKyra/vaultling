@@ -156,6 +156,28 @@ pub fn parse(text: &str) -> Result<(Source, Vec<Incoming>), ImportError> {
     parse_counting(text).map(|(source, rows, _)| (source, rows))
 }
 
+/// Drop rows that already exist, or that repeat earlier rows of the same file.
+///
+/// Two entries are the same when name (ignoring case), username and password
+/// all match. `existing` is `(name, username, password)` of what the vault
+/// already holds. Returns the rows to insert and how many were dropped.
+pub fn without_duplicates<'a>(
+    existing: impl IntoIterator<Item = (&'a str, &'a str, &'a str)>,
+    rows: Vec<Incoming>,
+) -> (Vec<Incoming>, usize) {
+    let mut seen: std::collections::HashSet<(String, String, String)> = existing
+        .into_iter()
+        .map(|(n, u, p)| (n.to_lowercase(), u.to_string(), p.to_string()))
+        .collect();
+    let before = rows.len();
+    let kept: Vec<Incoming> = rows
+        .into_iter()
+        .filter(|r| seen.insert((r.name.to_lowercase(), r.username.clone(), r.password.clone())))
+        .collect();
+    let dropped = before - kept.len();
+    (kept, dropped)
+}
+
 /// Like [`parse`], and also says how many rows were left out because they
 /// carried no password, so the caller can tell the user instead of letting
 /// entries disappear without a word.
@@ -292,6 +314,31 @@ mod tests {
         let (_, rows) = parse(csv).unwrap();
         assert_eq!(rows.len(), 1, "a quoted newline must not split the record");
         assert_eq!(rows[0].notes.as_deref(), Some("line one\nline two"));
+    }
+
+    #[test]
+    fn duplicates_of_the_vault_and_of_the_file_are_dropped() {
+        let row = |n: &str, u: &str, p: &str| Incoming {
+            name: n.into(),
+            username: u.into(),
+            password: p.into(),
+            uri: None,
+            totp: None,
+            notes: None,
+            tags: None,
+        };
+        let rows = vec![
+            row("Mail", "me", "pw1"),
+            row("mail", "me", "pw1"),   // same entry, different case
+            row("Mail", "me", "pw2"),   // same name, different password: keep
+            row("Bank", "me", "pw3"),
+            row("Bank", "me", "pw3"),   // repeated within the file
+        ];
+        let (kept, dropped) = without_duplicates([("Bank", "me", "pw3")], rows);
+        assert_eq!(dropped, 3);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].password, "pw1");
+        assert_eq!(kept[1].password, "pw2");
     }
 
     #[test]
