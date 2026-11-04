@@ -13,6 +13,8 @@ code. Synthetic data only.
 
 | 3 | Only the browsing list was drawn: when `browsing` was false (lock screen, vault creation, editor, import/export, settings, trash, help) no central panel was shown, so those screens rendered blank. | `src/bin/vaultling-gui.rs`, `update`, `if browsing { show_three_pane(..) }` had no `else` | High (app unusable outside the list) | Added the `else` branch with a full-width `CentralPanel`. | Screenshots of lock screen, editor and statistics panels under Xvfb. |
 | 4 | List card overflowed the centre pane (clipped at its right edge). | list row labels were untruncated | Low (UI) | Row labels truncate, row fills the available width. | Screenshot, dark and high-contrast. |
+| 6 | The Ctrl+C shortcut never worked: egui-winit converts it to `Event::Copy` and emits no key press, so the handler waiting for `Key::C` never fired. | `egui-winit-0.29/src/lib.rs:763`; GUI keyboard block | Medium (documented feature broken) | Handler also accepts `Event::Copy`. | Real run under Xvfb: clipboard held the entry's synthetic password after Ctrl+C, and a single space 20 s later. |
+| 7 | Forms (editor, settings, import, stats...) did not scroll, so the Save/Add button of the editor was out of reach in a normal-height window. | `form()` in `vaultling-gui.rs` | High (cannot add entries) | `form()` wraps its content in a vertical `ScrollArea`. | Real run: filled the editor, scrolled with the wheel, clicked Add; entry count went 36 to 37. |
 | 5 | `/`, Ctrl+C and the new shortcuts fired while typing in a text field (Ctrl+C overwrote the user's selection with the entry password). | `update`, keyboard block | Medium (secret to clipboard unintentionally) | Shortcuts are ignored when `wants_keyboard_input()`. | Code path only; no automated GUI input test. |
 
 Reviewed, no change needed: clipboard overwrite after 20 s runs independently
@@ -36,7 +38,7 @@ checked by unit test) with a Settings toggle.
 
 ## Remaining
 
-- Interaction was driven for real under Xvfb with xdotool: typing the path and passphrase and unlocking, Down x2 selecting the second entry, `?` opening the shortcuts overlay, Ctrl+L locking and clearing the passphrase field. Not driven: Select mode, bulk trash, Ctrl+C, the 760 px minimum width, the editor and import flows.
+- Interaction was driven for real under Xvfb with xdotool (synthetic vault): unlock by typing, arrow navigation, `?` overlay, Ctrl+L lock, Ctrl+C copy and 20 s clipboard overwrite, typing `a/b?c` in the search box without triggering shortcuts, Select mode with bulk move to trash (36 to 34), editor with Generate and Add (36 to 37). Not driven: the 760 px minimum width, import/export flows, favourites in bulk, restore from trash.
 - Added: a three-step first-run hint in the empty-vault state (not a wizard) and an opt-in Settings switch to show live two-factor codes in list rows (off by default, reset on lock).
 - Not implemented: full onboarding wizard, import preview/mapping, custom-fields editor beyond the existing category fields, related entries, skeleton/loading states, reduced-motion switch, screen-reader labels (limited by the egui version in use).
 - Pre-existing clippy warnings remain in other modules.

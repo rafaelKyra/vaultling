@@ -1082,15 +1082,23 @@ fn form<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     // pinned to the left edge with a third of the window empty beside it,
     // which looks like a layout that ran out rather than one that was chosen.
     let pad = ((ui.available_width() - width) / 2.0).max(0.0);
-    ui.horizontal(|ui| {
-        ui.add_space(pad);
-        ui.vertical(|ui| {
-            ui.set_max_width(width);
-            card(ui, add)
+    // Scrollable: a tall form (the editor with sixteen categories and notes)
+    // is taller than the window, and without this its Save button is simply
+    // out of reach.
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.add_space(pad);
+                ui.vertical(|ui| {
+                    ui.set_max_width(width);
+                    card(ui, add)
+                })
+                .inner
+            })
+            .inner
         })
         .inner
-    })
-    .inner
 }
 
 /// A raised surface.
@@ -2089,7 +2097,11 @@ impl eframe::App for App {
                 let plain = !typing && !i.modifiers.any();
                 (
                     i.key_pressed(egui::Key::L) && i.modifiers.ctrl,
-                    i.key_pressed(egui::Key::C) && i.modifiers.ctrl && !typing,
+                    // egui-winit turns Ctrl+C into `Event::Copy` and emits no key
+                    // press for it, so the key alone never fires.
+                    (i.key_pressed(egui::Key::C) && i.modifiers.ctrl
+                        || i.events.iter().any(|e| matches!(e, egui::Event::Copy)))
+                        && !typing,
                     i.key_pressed(egui::Key::Escape),
                     i.key_pressed(egui::Key::Slash) && plain,
                     // `?` arrives as a text event, not a key press, on most layouts.
@@ -3020,10 +3032,10 @@ impl App {
                     self.ticked_ids.clear();
                 }
                 let any = !self.ticked_ids.is_empty();
-                if ui.add_enabled(any, egui::Button::new("\u{2605} Favourite").small()).clicked() {
+                if ui.add_enabled(any, egui::Button::new("\u{2605}").small()).on_hover_text("Mark as favourite").clicked() {
                     self.bulk(Bulk::Favorite(true));
                 }
-                if ui.add_enabled(any, egui::Button::new("\u{2606} Unfavourite").small()).clicked() {
+                if ui.add_enabled(any, egui::Button::new("\u{2606}").small()).on_hover_text("Remove from favourites").clicked() {
                     self.bulk(Bulk::Favorite(false));
                 }
                 if ui
@@ -4406,7 +4418,7 @@ impl App {
         let with_2fa = self.rows.iter().filter(|r| r.totp.is_some()).count();
         let favs = self.rows.iter().filter(|r| r.favorite).count();
         let counts = kind_counts(&self.rows);
-        form(ui, |ui| egui::ScrollArea::vertical().show(ui, |ui| {
+        form(ui, |ui| {
             ui.label(egui::RichText::new("Vault statistics").size(17.0).strong());
             ui.add_space(10.0);
             egui::Grid::new("stats").num_columns(2).spacing([24.0, 6.0]).show(ui, |ui| {
@@ -4447,7 +4459,7 @@ impl App {
             if ui.button("Back").clicked() {
                 self.panel = Panel::List;
             }
-        }));
+        });
     }
 
     fn settings_view(&mut self, ui: &mut egui::Ui) {
