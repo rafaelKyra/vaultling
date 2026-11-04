@@ -17,8 +17,10 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// One row on the way out. Mirrors what `import::Incoming` reads back in, so a
-/// Vaultling export re-imports into Vaultling without loss.
+/// One row on the way out. Mirrors what `import::Incoming` reads back in. The
+/// CSV carries only these seven columns, so the category and any category-
+/// specific fields are not exported, and entries with no password are not
+/// re-imported: use the encrypted backup for a lossless copy.
 pub struct Outgoing {
     pub name: String,
     pub username: String,

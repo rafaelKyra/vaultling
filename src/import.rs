@@ -153,6 +153,13 @@ pub fn detect(headers: &[String]) -> Source {
 
 /// Parse a CSV export into rows ready for the vault.
 pub fn parse(text: &str) -> Result<(Source, Vec<Incoming>), ImportError> {
+    parse_counting(text).map(|(source, rows, _)| (source, rows))
+}
+
+/// Like [`parse`], and also says how many rows were left out because they
+/// carried no password, so the caller can tell the user instead of letting
+/// entries disappear without a word.
+pub fn parse_counting(text: &str) -> Result<(Source, Vec<Incoming>, usize), ImportError> {
     let recs = records(text);
     if recs.is_empty() {
         return Err(ImportError::Empty);
@@ -181,6 +188,7 @@ pub fn parse(text: &str) -> Result<(Source, Vec<Incoming>), ImportError> {
     };
 
     let mut out = Vec::new();
+    let mut skipped = 0usize;
     for (n, rec) in recs.iter().enumerate().skip(1) {
         let row = split_csv_line(rec);
         // Trailing empty columns are common and harmless; a row that is short
@@ -192,6 +200,7 @@ pub fn parse(text: &str) -> Result<(Source, Vec<Incoming>), ImportError> {
         // Rows with no password are bookmarks, not credentials. Chrome and
         // Firefox both emit them.
         if password.is_empty() {
+            skipped += 1;
             continue;
         }
         let name = get(&row, i_name)
@@ -209,7 +218,7 @@ pub fn parse(text: &str) -> Result<(Source, Vec<Incoming>), ImportError> {
         });
     }
 
-    Ok((source, out))
+    Ok((source, out, skipped))
 }
 
 #[cfg(test)]
@@ -283,6 +292,14 @@ mod tests {
         let (_, rows) = parse(csv).unwrap();
         assert_eq!(rows.len(), 1, "a quoted newline must not split the record");
         assert_eq!(rows[0].notes.as_deref(), Some("line one\nline two"));
+    }
+
+    #[test]
+    fn counts_the_rows_it_skips() {
+        let csv = "name,username,password,url\nA,u,pw,\nB,u,,\nC,u,,\n";
+        let (_, rows, skipped) = parse_counting(csv).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(skipped, 2);
     }
 
     #[test]

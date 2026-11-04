@@ -4019,9 +4019,10 @@ impl App {
         let (Some(db), Some(session)) = (self.db.as_ref(), self.session.as_ref()) else {
             return self.set("vault is locked", Level::Bad);
         };
-        let result = (|| -> Result<(String, usize), String> {
+        let result = (|| -> Result<(String, usize, usize), String> {
             let text = std::fs::read_to_string(&path).map_err(|_| "cannot read that file")?;
-            let (source, rows) = vaultling::import::parse(&text).map_err(|e| e.to_string())?;
+            let (source, rows, skipped) =
+                vaultling::import::parse_counting(&text).map_err(|e| e.to_string())?;
             for r in &rows {
                 db.insert_entry_full(
                     session, &r.name, &r.username, &r.password,
@@ -4030,14 +4031,19 @@ impl App {
                 )
                 .map_err(|e| e.to_string())?;
             }
-            Ok((source.name().to_string(), rows.len()))
+            Ok((source.name().to_string(), rows.len(), skipped))
         })();
         match result {
-            Ok((source, n)) => {
+            Ok((source, n, skipped)) => {
                 self.csv_path.clear();
                 self.reload();
                 self.panel = Panel::List;
-                self.set(format!("Imported {n} entries from {source}"), Level::Ok);
+                let note = if skipped > 0 {
+                    format!(", {skipped} skipped (no password)")
+                } else {
+                    String::new()
+                };
+                self.set(format!("Imported {n} entries from {source}{note}"), Level::Ok);
             }
             Err(why) => self.set(why, Level::Bad),
         }
