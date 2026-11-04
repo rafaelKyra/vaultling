@@ -36,16 +36,18 @@ impl ThreePaneLayout {
 
     /// Show the three-pane layout with the given content closures.
     ///
-    /// The closures are called sequentially (sidebar, then detail, then center),
-    /// each receiving `&mut app` so they can mutably borrow the same state
+    /// Closure order matches the on-screen order left to right: sidebar,
+    /// center, detail. The closures are called sequentially (sidebar, detail,
+    /// then center, because side panels must be laid out before the central
+    /// panel), each receiving `&mut app` so they can mutably borrow the same state
     /// without borrow-checker conflicts.
     pub fn show<App, F1, F2, F3>(
         self,
         ctx: &egui::Context,
         app: &mut App,
         sidebar: F1,
-        detail: F3,
         center: F2,
+        detail: F3,
     ) where
         F1: FnOnce(&mut egui::Ui, &mut App),
         F2: FnOnce(&mut egui::Ui, &mut App),
@@ -103,4 +105,71 @@ pub fn show_three_pane<App, F1, F2, F3>(
     F3: FnOnce(&mut egui::Ui, &mut App),
 {
     ThreePaneLayout::new().show(ctx, app, sidebar, center, detail);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(width: f32) -> Vec<&'static str> {
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 600.0))),
+            ..Default::default()
+        };
+        let mut calls: Vec<&'static str> = Vec::new();
+        let _ = ctx.run(raw, |ctx| {
+            show_three_pane(
+                ctx,
+                &mut calls,
+                |_, c| c.push("sidebar"),
+                |_, c| c.push("center"),
+                |_, c| c.push("detail"),
+            );
+        });
+        calls
+    }
+
+    #[test]
+    fn closures_render_in_their_own_slots() {
+        // Regression: the wrapper once passed `center` into the detail slot.
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1200.0, 700.0),
+        )),
+            ..Default::default()
+        };
+        let mut rects: std::collections::HashMap<&str, egui::Rect> = Default::default();
+        // Two frames: egui settles panel sizes after the first pass.
+        for _ in 0..2 {
+            let _ = ctx.run(raw.clone(), |ctx| {
+                show_three_pane(
+                    ctx,
+                    &mut rects,
+                    |ui, r| {
+                        r.insert("sidebar", ui.max_rect());
+                    },
+                    |ui, r| {
+                        r.insert("center", ui.max_rect());
+                    },
+                    |ui, r| {
+                        r.insert("detail", ui.max_rect());
+                    },
+                );
+            });
+        }
+        assert!(rects["sidebar"].right() <= rects["center"].left() + 1.0);
+        assert!(rects["center"].right() <= rects["detail"].left() + 1.0);
+    }
+
+    #[test]
+    fn every_pane_runs_once_at_small_and_large_sizes() {
+        for w in [480.0, 800.0, 1600.0] {
+            let mut calls = run(w);
+            calls.sort();
+            assert_eq!(calls, ["center", "detail", "sidebar"], "width {w}");
+        }
+    }
 }

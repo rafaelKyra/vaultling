@@ -395,6 +395,31 @@ fn generate_password() -> String {
 ///
 /// Not a dictionary check — "Password1!" scores respectably here and is
 /// terrible — so the label always says "estimate".
+/// Overwrite decrypted entry and history text before dropping it, so a lock
+/// does not leave old passwords sitting in freed heap pages longer than needed.
+/// Best effort: copies made by egui or the allocator are outside our reach.
+fn wipe_secrets(rows: &mut Vec<Row>, history: &mut Vec<(i64, String, Option<String>)>) {
+    use zeroize::Zeroize;
+    for r in rows.iter_mut() {
+        r.password.zeroize();
+        r.username.zeroize();
+        if let Some(n) = r.notes.as_mut() {
+            n.zeroize();
+        }
+        if let Some(t) = r.totp.as_mut() {
+            t.zeroize();
+        }
+        for (_, v) in r.fields.iter_mut() {
+            v.zeroize();
+        }
+    }
+    rows.clear();
+    for h in history.iter_mut() {
+        h.1.zeroize();
+    }
+    history.clear();
+}
+
 fn strength(password: &str) -> (f32, &'static str, egui::Color32) {
     if password.is_empty() {
         return (0.0, "", palette().muted);
@@ -613,7 +638,13 @@ impl App {
         }
         self.db = None;
         self.vault_path = None;
-        self.rows.clear();
+        wipe_secrets(&mut self.rows, &mut self.history_rows);
+        self.trash_rows.clear();
+        self.tag_filter = None;
+        self.new_pass.clear();
+        self.new_pass_again.clear();
+        self.csv_path.clear();
+        self.export_path.clear();
         self.open_entry = None;
         self.reveal_password = false;
         self.reveal_notes = false;
@@ -4298,4 +4329,30 @@ fn main() -> eframe::Result {
             Ok(Box::new(App::default()))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wipe_secrets_empties_rows_and_history() {
+        let mut rows = vec![Row {
+            id: 1,
+            favorite: false,
+            updated_at: 0,
+            name: "n".into(),
+            username: "u".into(),
+            uri: None,
+            totp: Some("JBSWY3DPEHPK3PXP".into()),
+            tags: None,
+            notes: Some("note".into()),
+            password: "synthetic-pw".into(),
+            kind: Kind::Website,
+            fields: vec![("k".into(), "v".into())],
+        }];
+        let mut history = vec![(1, "old-synthetic-pw".to_string(), None)];
+        wipe_secrets(&mut rows, &mut history);
+        assert!(rows.is_empty() && history.is_empty());
+    }
 }

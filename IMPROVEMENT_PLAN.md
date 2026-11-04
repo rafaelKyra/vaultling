@@ -55,6 +55,29 @@ This plan outlines improvements to the Vaultling GUI focusing on:
 - Help/tooltips system
 - Vault statistics dashboard
 
+## Status (re-validated against the code, 2026-11-04)
+
+Legend: done / partial / missing. Evidence is in `src/bin/vaultling-gui.rs` unless noted.
+
+| Item | Status | Evidence |
+|---|---|---|
+| Design tokens, light/dark palette | done | `src/gui/design_system.rs`, `palette()`/`set_palette` |
+| Hardcoded colours replaced | partial | `apply_theme` still sets some literal `Color32` values |
+| Three-pane layout | done (fixed) | `src/gui/layout.rs`; slot-order bug fixed, tests added |
+| Responsive breakpoints | missing | panels are resizable, no collapse at small widths |
+| Keyboard shortcuts (Ctrl+L, Ctrl+C, Esc, /) | partial | no `?` overlay, no list arrow-key navigation |
+| Password generator | done | `generate_password` |
+| Strength meter | done | `strength`, `meter` |
+| Entry types / categories (16 kinds) | done | `vaultling::kind` |
+| Tags, favourites, sort (name/recent) | partial | sort by created/category missing |
+| Multi-select / bulk actions | missing | |
+| TOTP in detail with countdown | done | detail pane; not shown in list rows |
+| Password history | done | `history_rows` |
+| Stats dashboard, onboarding, high contrast | missing | health score only |
+
+Implementation order: finish visual foundation and navigation (rows marked
+partial in the first half of the table) before any new feature.
+
 ## Implementation Phases
 
 ### Phase 1: Design System Foundation (Week 1)
@@ -131,7 +154,7 @@ This plan outlines improvements to the Vaultling GUI focusing on:
 - Maintain backward compatibility with existing vault format
 
 ## Success Criteria
-- [ ] All 119 existing tests still pass
+- [x] All existing tests still pass (now 121 lib + 1 gui)
 - [ ] New GUI builds without warnings
 - [ ] Visual consistency across all views
 - [ ] Keyboard navigation works for all major flows
